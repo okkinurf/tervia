@@ -147,6 +147,129 @@ pub struct SshOpened {
     pub fingerprint: String,
 }
 
+/// Cumulative counters and current capacities from one Linux SSH host sample.
+/// The frontend derives rates from consecutive samples so polling stays stateless.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshResourceSample {
+    pub cpu_total: u64,
+    pub cpu_idle: u64,
+    pub memory_total: u64,
+    pub memory_available: u64,
+    pub filesystems: Vec<SshFilesystemUsage>,
+    pub disk_read_sectors: u64,
+    pub disk_write_sectors: u64,
+    pub network_received: u64,
+    pub network_sent: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshFilesystemUsage {
+    pub mount: String,
+    pub total_kib: u64,
+    pub used_kib: u64,
+}
+
+fn parse_resource_sample(raw: &str) -> Result<SshResourceSample, String> {
+    let mut cpu = None;
+    let mut memory_total = None;
+    let mut memory_available = None;
+    let mut filesystems = Vec::new();
+    let mut disk_read_sectors = 0_u64;
+    let mut disk_write_sectors = 0_u64;
+    let mut network_received = 0_u64;
+    let mut network_sent = 0_u64;
+    let mut in_net = false;
+    let mut in_fs = false;
+
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.starts_with("cpu ") {
+            let values = line
+                .split_whitespace()
+                .skip(1)
+                .map(str::parse::<u64>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "ssh resources: invalid CPU counters".to_string())?;
+            if values.len() >= 5 {
+                cpu = Some((values.iter().sum(), values[3].saturating_add(values[4])));
+            }
+        } else if let Some(value) = line.strip_prefix("MemTotal:") {
+            memory_total = value.split_whitespace().next().and_then(|v| v.parse().ok());
+        } else if let Some(value) = line.strip_prefix("MemAvailable:") {
+            memory_available = value.split_whitespace().next().and_then(|v| v.parse().ok());
+        } else if line == "NET" {
+            in_net = true;
+            in_fs = false;
+        } else if line == "FS" {
+            in_net = false;
+            in_fs = true;
+        } else if in_net {
+            if let Some((iface, counters)) = line.split_once(':') {
+                if iface.trim() != "lo" {
+                    let fields = counters
+                        .split_whitespace()
+                        .map(str::parse::<u64>)
+                        .collect::<Result<Vec<_>, _>>();
+                    if let Ok(fields) = fields {
+                        if fields.len() >= 9 {
+                            network_received = network_received.saturating_add(fields[0]);
+                            network_sent = network_sent.saturating_add(fields[8]);
+                        }
+                    }
+                }
+            }
+        } else if in_fs && !line.starts_with("Filesystem") {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() >= 6 {
+                if let (Ok(total), Ok(used)) = (fields[1].parse(), fields[2].parse()) {
+                    let mount = fields.last().copied().unwrap_or_default().to_string();
+                    if !filesystems
+                        .iter()
+                        .any(|entry: &SshFilesystemUsage| entry.mount == mount)
+                    {
+                        filesystems.push(SshFilesystemUsage {
+                            mount,
+                            total_kib: total,
+                            used_kib: used,
+                        });
+                    }
+                }
+            }
+        } else if !line.is_empty() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            // `/sys/block/*/stat` rows are prefixed with the device name. Its
+            // sector counters exclude partitions, avoiding double counting.
+            if fields.len() >= 8 && fields[0] != "cpu" {
+                if let (Ok(read), Ok(write)) = (fields[3].parse::<u64>(), fields[7].parse::<u64>())
+                {
+                    disk_read_sectors = disk_read_sectors.saturating_add(read);
+                    disk_write_sectors = disk_write_sectors.saturating_add(write);
+                }
+            }
+        }
+    }
+
+    let (cpu_total, cpu_idle) = cpu.ok_or_else(|| {
+        "Resource metrics are unavailable: this SSH host must be Linux with /proc and /sys."
+            .to_string()
+    })?;
+    Ok(SshResourceSample {
+        cpu_total,
+        cpu_idle,
+        memory_total: memory_total
+            .ok_or_else(|| "ssh resources: MemTotal unavailable".to_string())?,
+        memory_available: memory_available
+            .ok_or_else(|| "ssh resources: MemAvailable unavailable".to_string())?,
+        filesystems,
+        disk_read_sectors,
+        disk_write_sectors,
+        network_received,
+        network_sent,
+    })
+}
+
 /// One hop's secrets, read out of the keychain at the command boundary.
 #[derive(Default)]
 pub struct HopSecrets {
@@ -851,6 +974,26 @@ async fn shell_of(
         log::warn!("{cmd}: unknown shell={shell_id} on id={id}");
         "no shell".to_string()
     })
+}
+
+/// Read a bounded set of Linux host counters over an existing SSH connection.
+/// The command is static and opens its own short-lived channel, leaving the
+/// user's interactive shell untouched.
+#[tauri::command]
+pub async fn ssh_resource_sample(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+) -> Result<SshResourceSample, String> {
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "no SSH session".to_string())?;
+    let command = r#"printf 'CPU\n'; grep '^cpu ' /proc/stat; printf 'MEM\n'; grep -E '^(MemTotal|MemAvailable):' /proc/meminfo; for d in /sys/block/*; do [ -r "$d/stat" ] && { printf '%s ' "${d##*/}"; cat "$d/stat"; }; done; printf 'NET\n'; cat /proc/net/dev; printf 'FS\n'; for p in / /init /tmp; do [ -e "$p" ] && df -Pk "$p"; done"#;
+    let raw = session.exec_capture(command).await?;
+    parse_resource_sample(&raw)
 }
 
 /// Open one more interactive shell (a terminal tab) on the live session `id`,

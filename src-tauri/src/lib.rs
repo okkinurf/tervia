@@ -764,6 +764,7 @@ pub fn run() {
             ssh::ssh_shell_write,
             ssh::ssh_shell_resize,
             ssh::ssh_shell_close,
+            ssh::ssh_resource_sample,
             ssh::ssh_close,
             ssh::ssh_confirm_host_key,
             ssh::ssh_agent_keys,

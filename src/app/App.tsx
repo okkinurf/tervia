@@ -838,6 +838,7 @@ export default function App() {
             hasAnySshLeaf={hasAnySshLeaf}
             activeIsSsh={activeLeafIsSsh}
             sshSessionId={activeLeafIsSsh ? activeSshContext.sessionId : null}
+            sshHostLabel={activeLeafIsSsh ? activeSshContext.hostLabel : null}
             sshRoute={
               activeLeafIdInTab != null ? sshStatuses.get(activeLeafIdInTab)?.route : undefined
             }

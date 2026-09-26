@@ -17,6 +17,11 @@ the same change that lifts it.
   `MAX_UPLOAD_BYTES`).
 - **SSH**: `ssh-rsa` (SHA-1) host keys. `src-tauri/src/modules/ssh/session.rs`
   (`HOST_KEY_ALGOS`).
+- **Resource monitoring**: live metrics require a Linux SSH host with `/proc`
+  and `/sys` plus remote command execution; RDP and non-Linux SSH hosts report
+  metrics unavailable. `src-tauri/src/modules/ssh/mod.rs`
+  (`ssh_resource_sample`), `src/modules/terminal/ResourceMonitor.tsx`.
+  Changes when: metrics can be collected through another supported channel.
 - **Forwards**: binding `-L` or `-D` to anything but `127.0.0.1`; SOCKS5
   auth or anything but CONNECT. `src-tauri/src/modules/ssh/session.rs`
   (`open_forward`, `open_socks`).

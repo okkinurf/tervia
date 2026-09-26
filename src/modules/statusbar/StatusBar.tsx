@@ -12,6 +12,7 @@ import { IS_LINUX, IS_MAC, IS_WINDOWS } from "@/lib/platform";
 import { CwdBreadcrumb } from "./CwdBreadcrumb";
 import { ZoomControl } from "./ZoomControl";
 import { Server } from "lucide-react";
+import { SshResourceBar } from "@/modules/terminal/ResourceMonitor";
 
 type Props = {
   cwd: string | null;
@@ -28,6 +29,8 @@ type Props = {
    *  the breadcrumb browse subfolders remotely instead of hitting the local
    *  filesystem with a remote path. */
   sshSessionId?: number | null;
+  /** Host label for the connected SSH session currently shown in the status bar. */
+  sshHostLabel?: string | null;
   /** ProxyJump chain of the active SSH leaf, when it has one. Takes the slot
    *  the local-OS badge vacates on an SSH pane, which is the honest thing to
    *  put there: what this shell is actually reached through. */
@@ -53,13 +56,19 @@ function StatusBarInner({
   hasAnySshLeaf,
   activeIsSsh,
   sshSessionId,
+  sshHostLabel,
   sshRoute,
 }: Props) {
   const compact = usePreferencesStore((s) => s.statusBarCompact);
 
   return (
-    <footer className="border-border/60 bg-card/60 flex h-8 shrink-0 items-center justify-between gap-3 border-t px-3 text-[11px]">
-      <div className="flex min-w-0 flex-1 items-center gap-1.5 truncate">
+    <footer className="border-border/60 bg-card/60 flex h-8 shrink-0 items-center justify-between gap-2 border-t px-3 text-[11px]">
+      <div
+        className={cn(
+          "flex min-w-0 items-center gap-1.5 truncate",
+          activeIsSsh && sshSessionId != null ? "max-w-[32%] flex-[0_1_32%]" : "flex-1",
+        )}
+      >
         {/* One slot, two readings of "where am I". A jump chain wins whenever
             there is one - deliberately NOT gated on `activeIsSsh`, which is
             only true once the session is fully connected: the route is most
@@ -77,6 +86,9 @@ function StatusBarInner({
           sshSessionId={sshSessionId}
         />
       </div>
+      {activeIsSsh && sshSessionId != null && (
+        <SshResourceBar sessionId={sshSessionId} hostLabel={sshHostLabel ?? null} />
+      )}
       {/* Left to right: the update prompt, the zoom pill, then the panel
           toggles you CLICK. Zoom is only on screen while zoomed, and that is
           where it is wanted. Compact mode keeps only what you glance at - the

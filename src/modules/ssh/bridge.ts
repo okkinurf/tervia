@@ -9,6 +9,22 @@ import {
 } from "@/modules/terminal/lib/ssh-exit-decision";
 import type { SecretSource } from "@/modules/vault/resolve";
 
+export type SshResourceSample = {
+  cpuTotal: number;
+  cpuIdle: number;
+  memoryTotal: number;
+  memoryAvailable: number;
+  filesystems: { mount: string; totalKib: number; usedKib: number }[];
+  diskReadSectors: number;
+  diskWriteSectors: number;
+  networkReceived: number;
+  networkSent: number;
+};
+
+export function readSshResourceSample(sessionId: number): Promise<SshResourceSample> {
+  return invoke<SshResourceSample>("ssh_resource_sample", { id: sessionId });
+}
+
 /** First-connect host-key confirmation request from the backend. */
 export type SshHostKeyPrompt = { promptId: string; fingerprint: string; host: string };
 
