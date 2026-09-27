@@ -11,10 +11,11 @@ the same change that lifts it.
   RD Gateway, Kerberos (NTLM only), multi-monitor, `.rdp` import, 9+
   sessions. `src-tauri/src/modules/rdp/mod.rs` (module docs,
   `MAX_RDP_SESSIONS`), `session.rs` (`NoNetworkClient`).
-- **SFTP**: download to local disk, folder upload, opening files over
-  16 MiB or not UTF-8, uploads over 256 MiB.
-  `src-tauri/src/modules/ssh/sftp.rs` (`MAX_SFTP_READ_BYTES`,
-  `MAX_UPLOAD_BYTES`).
+- **SFTP**: folder download, folder upload, dragging a remote file out to
+  the OS file manager, opening files over 16 MiB or not UTF-8, uploads or
+  downloads over 256 MiB. `src-tauri/src/modules/ssh/sftp.rs`
+  (`MAX_SFTP_READ_BYTES`, `MAX_UPLOAD_BYTES`, `MAX_DOWNLOAD_BYTES`),
+  `src/modules/terminal/lib/useTerminalFileDrop.ts` (`ensureFsDragListener`).
 - **SSH**: `ssh-rsa` (SHA-1) host keys. `src-tauri/src/modules/ssh/session.rs`
   (`HOST_KEY_ALGOS`).
 - **Forwards**: binding `-L` or `-D` to anything but `127.0.0.1`; SOCKS5
@@ -23,6 +24,11 @@ the same change that lifts it.
 - **Import**: `ssh_config` stanzas using `ProxyCommand`, `Include`, `Match`
   or wildcard `Host`; PuTTY sessions with a proxy or a non-SSH protocol.
   `src/modules/backup/sshConfigImport.ts`, `puttyRegImport.ts`.
+- **Terminal OSC 52**: clipboard reads (a `?` request is never answered), a
+  separate PRIMARY selection (every target writes the system clipboard), and
+  copies over 1 MiB decoded (dropped).
+  `src/modules/terminal/lib/osc-handlers.ts` (`registerClipboardHandler`,
+  `OSC52_MAX_BYTES`).
 
 ## SSH sessions
 

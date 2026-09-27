@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileType, OpenFlags, StatusCode};
@@ -95,11 +96,11 @@ fn humanize(err: SftpError) -> String {
     }
 }
 
-/// Byte-level upload progress streamed to the frontend so the SSH explorer
-/// can show a moving percentage while a dropped file transfers.
+/// Byte-level transfer progress streamed to the frontend so the SSH explorer
+/// shows a moving percentage for an upload or a download.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UploadProgress {
+pub struct TransferProgress {
     pub written: u64,
     pub total: u64,
 }
@@ -235,7 +236,7 @@ pub async fn ssh_sftp_upload(
     id: u32,
     local_path: String,
     remote_path: String,
-    on_progress: Channel<UploadProgress>,
+    on_progress: Channel<TransferProgress>,
 ) -> Result<(), String> {
     // Cap the whole-file read so a huge drop can't OOM the app. Matches the
     // read-file guard's intent; uploads get a larger ceiling.
@@ -272,14 +273,14 @@ pub async fn ssh_sftp_upload(
         // keeps the event count bounded (<=1024 for the 256 MiB cap) while
         // still feeling live. Send an initial 0% so the bar appears at once.
         const CHUNK: usize = 256 * 1024;
-        let _ = on_progress.send(UploadProgress { written: 0, total });
+        let _ = on_progress.send(TransferProgress { written: 0, total });
         let mut written: u64 = 0;
         for chunk in bytes.chunks(CHUNK) {
             file.write_all(chunk)
                 .await
                 .map_err(|e| format!("sftp write: {e}"))?;
             written += chunk.len() as u64;
-            let _ = on_progress.send(UploadProgress { written, total });
+            let _ = on_progress.send(TransferProgress { written, total });
         }
         file.shutdown()
             .await
@@ -287,6 +288,126 @@ pub async fn ssh_sftp_upload(
         Ok(())
     })
     .await
+}
+
+/// Read a whole remote file into memory for `ssh_sftp_download`, reporting
+/// `{written, total}` as each chunk arrives. Regular files only; a folder or
+/// a device (which stats at 0 bytes and never ends) is refused.
+pub(super) async fn ssh_sftp_download_inner(
+    sftp: &SftpSession,
+    remote_path: String,
+    on_progress: &Channel<TransferProgress>,
+) -> Result<Vec<u8>, String> {
+    // The whole file is buffered before the local write; this bounds that
+    // buffer, mirroring the upload cap.
+    const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+    let meta = sftp.metadata(remote_path.clone()).await.map_err(humanize)?;
+    match meta.file_type() {
+        FileType::File => {}
+        FileType::Dir => return Err("cannot download a folder (files only)".to_string()),
+        // A server that omits the mode, or sends one with no file-type bits,
+        // reports every entry as `Other`; let the read decide rather than
+        // refuse every download there.
+        _ if meta.permissions.is_none_or(|m| m & 0o170000 == 0) => {}
+        _ => return Err("cannot download a device or special file (files only)".to_string()),
+    }
+    let total = meta.len();
+    if total > MAX_DOWNLOAD_BYTES {
+        return Err(format!(
+            "file too large to download: {total} bytes (cap {MAX_DOWNLOAD_BYTES} bytes)"
+        ));
+    }
+    let mut file = sftp.open(remote_path).await.map_err(humanize)?;
+    use tokio::io::AsyncReadExt;
+    const CHUNK: u64 = 256 * 1024;
+    let mut bytes = Vec::with_capacity(total as usize);
+    let _ = on_progress.send(TransferProgress { written: 0, total });
+    // ponytail: russh-sftp's AsyncRead issues one READ per round trip; pipeline
+    // offset reads if large downloads over high-latency links are too slow.
+    loop {
+        let n = (&mut file)
+            .take(CHUNK)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| format!("sftp read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "file grew past the download cap ({MAX_DOWNLOAD_BYTES} bytes)"
+            ));
+        }
+        let _ = on_progress.send(TransferProgress {
+            written: bytes.len() as u64,
+            total,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Write a finished download to `path`. `overwrite: true` stages and renames
+/// over the target, so a failed write leaves the original intact.
+/// `overwrite: false` refuses an existing file atomically (`create_new`), and
+/// a failed write removes the partial file: it would look like a finished
+/// download.
+fn write_local_file(path: &str, bytes: &[u8], overwrite: bool) -> Result<(), String> {
+    use std::io::Write;
+    if overwrite {
+        return crate::modules::fs::atomic::atomic_write(std::path::Path::new(path), bytes)
+            .map_err(|e| format!("write local file: {e}"));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{path} already exists")
+            } else {
+                format!("write local file: {e}")
+            }
+        })?;
+    if let Err(e) = file.write_all(bytes) {
+        // Close first: Windows cannot delete an open file.
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("write local file: {e}"));
+    }
+    Ok(())
+}
+
+/// Download a remote file to `local_path`, the mirror of `ssh_sftp_upload`:
+/// bytes stay in Rust, so binary files arrive intact. The remote read
+/// finishes before the local file is opened, so a failed read leaves an
+/// existing local file untouched. Files only. `overwrite: false` is checked
+/// up front and again atomically by `create_new`; the save-dialog path passes
+/// `true` because the OS dialog already confirmed the replace.
+#[tauri::command]
+pub async fn ssh_sftp_download(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    remote_path: String,
+    local_path: String,
+    overwrite: bool,
+    on_progress: Channel<TransferProgress>,
+) -> Result<(), String> {
+    if !overwrite {
+        let check = local_path.clone();
+        let exists = tokio::task::spawn_blocking(move || std::fs::symlink_metadata(&check).is_ok())
+            .await
+            .map_err(|e| format!("local check join failed: {e}"))?;
+        if exists {
+            return Err(format!("{local_path} already exists"));
+        }
+    }
+    let bytes = on_sftp(&state, id, move |sftp| async move {
+        ssh_sftp_download_inner(&sftp, remote_path, &on_progress).await
+    })
+    .await?;
+    tokio::task::spawn_blocking(move || write_local_file(&local_path, &bytes, overwrite))
+        .await
+        .map_err(|e| format!("write task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -334,9 +455,121 @@ pub async fn ssh_sftp_rename(
     to: String,
 ) -> Result<(), String> {
     on_sftp(&state, id, move |sftp| async move {
-        sftp.rename(from, to).await.map_err(humanize)
+        ssh_sftp_rename_inner(&sftp, from, to).await
     })
     .await
+}
+
+/// Rename or move `from` to `to`, refusing an existing `to`. The LSTAT gives
+/// a clear "already exists" in place of whatever status the server returns,
+/// and refuses on a server whose RENAME would overwrite. A case-only rename
+/// (same folder, name differing only by case) skips the check: on a
+/// case-insensitive remote (Windows OpenSSH) the LSTAT finds the source itself.
+pub(super) async fn ssh_sftp_rename_inner(
+    sftp: &SftpSession,
+    from: String,
+    to: String,
+) -> Result<(), String> {
+    let case_only = match (from.rsplit_once('/'), to.rsplit_once('/')) {
+        (Some((from_dir, from_name)), Some((to_dir, to_name))) => {
+            from_dir == to_dir && from_name.to_lowercase() == to_name.to_lowercase()
+        }
+        _ => false,
+    };
+    if !case_only
+        && unless_gone(sftp.symlink_metadata(to.clone()).await)
+            .map_err(humanize)?
+            .is_some()
+    {
+        return Err(format!("{to} already exists"));
+    }
+    sftp.rename(from, to).await.map_err(humanize)
+}
+
+/// Requests the recursive delete keeps in flight. Enough to hide the round
+/// trip on a slow link. Bounded because the server answers one at a time and
+/// russh-sftp's 10 s response timeout starts when a request is queued.
+const DELETE_IN_FLIGHT: usize = 64;
+
+/// Delete `path` over SFTP; a directory goes with everything under it.
+/// SFTP `RMDIR` only removes an EMPTY directory, so the tree is walked first,
+/// one depth level at a time: every directory of the level is listed, then
+/// every listed non-directory is removed and every subdirectory becomes the
+/// next level. Each step keeps up to `DELETE_IN_FLIGHT` requests in flight, so
+/// a big tree costs about one round trip per `DELETE_IN_FLIGHT` entries, not
+/// one per entry. Levels are then removed deepest first, so each child goes
+/// before its parent. Symlinks are removed as links, their targets left alone:
+/// the top-level check is LSTAT, and an entry READDIR reports as a directory
+/// is LSTATed again before the walk goes into it, because READDIR attributes
+/// are lstat results on OpenSSH but may be followed-stat results elsewhere. A
+/// directory swapped for a link between that LSTAT and the READDIR is still
+/// followed; SFTP has no `openat`-style call to close that race. A child that
+/// vanishes mid-walk (a second Delete, another client) counts as removed, as
+/// in `std::fs::remove_dir_all`. Any other failure stops the walk and leaves
+/// whatever was not removed yet; requests already in flight may still land.
+pub(super) async fn ssh_sftp_delete_inner(
+    sftp: &SftpSession,
+    path: String,
+) -> Result<(), SftpError> {
+    if !sftp
+        .symlink_metadata(path.clone())
+        .await?
+        .file_type()
+        .is_dir()
+    {
+        return sftp.remove_file(path).await;
+    }
+    // ponytail: no progress or cancel. Stream counts over a `Channel` like
+    // `ssh_sftp_upload` if huge trees make the wait opaque.
+    let mut levels = vec![vec![path]];
+    loop {
+        // Every listing runs to the end before an error is returned: dropping
+        // a `read_dir` between its OPENDIR and CLOSE leaks a server handle.
+        let listings: Vec<_> = stream::iter(levels[levels.len() - 1].clone())
+            .map(|dir| async move { unless_gone(sftp.read_dir(dir).await) })
+            .buffer_unordered(DELETE_IN_FLIGHT)
+            .collect()
+            .await;
+        let listings = listings.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let subdirs: Vec<_> = stream::iter(listings.into_iter().flatten().flatten())
+            .map(|entry| async move {
+                let child = entry.path();
+                if entry.file_type().is_dir() {
+                    match unless_gone(sftp.symlink_metadata(child.clone()).await)? {
+                        Some(meta) if meta.file_type().is_dir() => return Ok(Some(child)),
+                        Some(_) => {}
+                        None => return Ok(None),
+                    }
+                }
+                unless_gone(sftp.remove_file(child).await)?;
+                Ok::<_, SftpError>(None)
+            })
+            .buffer_unordered(DELETE_IN_FLIGHT)
+            .try_collect()
+            .await?;
+        let subdirs: Vec<String> = subdirs.into_iter().flatten().collect();
+        if subdirs.is_empty() {
+            break;
+        }
+        levels.push(subdirs);
+    }
+    for level in levels.into_iter().rev() {
+        stream::iter(level)
+            .map(|dir| async move { unless_gone(sftp.remove_dir(dir).await).map(drop) })
+            .buffer_unordered(DELETE_IN_FLIGHT)
+            .try_collect::<()>()
+            .await?;
+    }
+    Ok(())
+}
+
+/// `Ok(None)` when the server says the path no longer exists.
+fn unless_gone<T>(result: Result<T, SftpError>) -> Result<Option<T>, SftpError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[tauri::command]
@@ -346,16 +579,7 @@ pub async fn ssh_sftp_delete(
     path: String,
 ) -> Result<(), String> {
     on_sftp(&state, id, move |sftp| async move {
-        // SFTP needs separate calls for files vs dirs. `rmdir` only
-        // succeeds on empty dirs on most servers. Stat once to pick the
-        // right call. Server permission errors surface through humanize()
-        // so the user sees `permission denied` instead of a generic failure.
-        let metadata = sftp.metadata(path.clone()).await.map_err(humanize)?;
-        if metadata.file_type().is_dir() {
-            sftp.remove_dir(path).await.map_err(humanize)
-        } else {
-            sftp.remove_file(path).await.map_err(humanize)
-        }
+        ssh_sftp_delete_inner(&sftp, path).await.map_err(humanize)
     })
     .await
 }
@@ -388,4 +612,27 @@ pub(super) async fn open_sftp_on_handle(session: &SshSession) -> Result<Arc<Sftp
         .await
         .map_err(|e| format!("ssh: sftp handshake failed: {e}"))?;
     Ok(Arc::new(sftp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_local_file;
+
+    #[test]
+    fn write_local_file_refuses_to_replace_unless_asked() {
+        let dir = std::env::temp_dir().join(format!("tervia-sftp-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.bin");
+        let path = path.to_str().unwrap();
+
+        write_local_file(path, b"one", false).unwrap();
+        let err = write_local_file(path, b"two", false).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read(path).unwrap(), b"one");
+
+        write_local_file(path, b"three", true).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"three");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -3792,7 +3792,7 @@ mod chain_tests {
     }
 }
 
-/// Live end-to-end checks for `-R`, `-D` and shells sharing one session,
+/// Live end-to-end checks for `-R`, `-D`, shells sharing one session, and SFTP delete,
 /// against a throwaway `/usr/sbin/sshd` this process spawns itself - unlike
 /// `chain_tests`' own live checks above, which need a real VPS and env vars.
 /// Every test here is
@@ -3883,7 +3883,8 @@ mod remote_dynamic_forward_tests {
                      UsePAM no\n\
                      StrictModes no\n\
                      AllowTcpForwarding yes\n\
-                     GatewayPorts no\n",
+                     GatewayPorts no\n\
+                     Subsystem sftp internal-sftp\n",
                     host_key.display(),
                     authorized_keys.display(),
                 ),
@@ -4235,5 +4236,168 @@ mod remote_dynamic_forward_tests {
             assert!(gone, "the ended shell left its session");
             eprintln!("[remote_dynamic_forward_tests] OK: a remote hangup fired the end signal");
         });
+    }
+
+    /// SFTP delete of a symlink-to-directory and of a non-empty folder. The sshd
+    /// is local, so the "remote" tree is built and checked with `std::fs`. The
+    /// link must go as a link, the folder must go with everything in it, and the
+    /// directory both links point at must survive.
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    #[cfg(unix)]
+    fn sftp_delete_removes_contents_without_following_symlinks() {
+        let Some(sshd) = TestSshd::start() else {
+            return;
+        };
+        let (input, secrets) = connect_input(&sshd);
+        let outside = sshd.dir.join("outside");
+        let top_link = sshd.dir.join("top-link");
+        let root = sshd.dir.join("del");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, &top_link).unwrap();
+        std::fs::create_dir_all(root.join("sub/deeper")).unwrap();
+        std::fs::write(root.join("top"), b"x").unwrap();
+        std::fs::write(root.join("sub/deeper/f"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sub/link")).unwrap();
+
+        let (link_arg, root_arg) = (
+            top_link.to_string_lossy().into_owned(),
+            root.to_string_lossy().into_owned(),
+        );
+        it_runtime().block_on(async move {
+            let session = connect(input, secrets, IpcChannel::new(|_msg| Ok(())))
+                .await
+                .expect("connect failed");
+            let sftp = session.ensure_sftp().await.expect("open sftp");
+            crate::modules::ssh::sftp::ssh_sftp_delete_inner(&sftp, link_arg)
+                .await
+                .expect("delete symlink failed");
+            crate::modules::ssh::sftp::ssh_sftp_delete_inner(&sftp, root_arg)
+                .await
+                .expect("delete non-empty folder failed");
+            session.close().await;
+        });
+
+        assert!(
+            std::fs::symlink_metadata(&top_link).is_err(),
+            "top-level symlink must be removed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&root).is_err(),
+            "non-empty folder must be removed"
+        );
+        assert!(
+            outside.join("keep").exists(),
+            "symlink target must be left alone"
+        );
+        eprintln!(
+            "[remote_dynamic_forward_tests] OK: sftp delete removed a link and a non-empty tree, target intact"
+        );
+    }
+
+    /// SFTP download of a binary file (byte-identical, progress emitted) and of
+    /// a folder (refused), then a move onto a taken name (refused, both files
+    /// intact) and a plain move (lands).
+    #[test]
+    #[ignore = "needs /usr/sbin/sshd"]
+    #[cfg(unix)]
+    fn sftp_download_and_move() {
+        let Some(sshd) = TestSshd::start() else {
+            return;
+        };
+        let (input, secrets) = connect_input(&sshd);
+        let payload: Vec<u8> = (0..700 * 1024).map(|i| (i % 251) as u8).collect();
+        let blob = sshd.dir.join("blob.bin");
+        let sub = sshd.dir.join("sub");
+        let loose = sshd.dir.join("loose.txt");
+        std::fs::write(&blob, &payload).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("blob.bin"), b"taken").unwrap();
+        std::fs::write(&loose, b"move me").unwrap();
+        // Sibling folders whose names differ only by case: a different file on
+        // this case-sensitive server, so the move must still be refused.
+        std::fs::create_dir_all(sshd.dir.join("Data")).unwrap();
+        std::fs::create_dir_all(sshd.dir.join("data")).unwrap();
+        std::fs::write(sshd.dir.join("Data/r.txt"), b"upper").unwrap();
+        std::fs::write(sshd.dir.join("data/r.txt"), b"lower").unwrap();
+
+        let arg = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let (blob_arg, sub_arg, loose_arg) = (arg(&blob), arg(&sub), arg(&loose));
+        let (taken_arg, moved_arg) = (arg(&sub.join("blob.bin")), arg(&sub.join("loose.txt")));
+        let (upper_arg, lower_arg) = (
+            arg(&sshd.dir.join("Data/r.txt")),
+            arg(&sshd.dir.join("data/r.txt")),
+        );
+        let events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = events.clone();
+        let expected = payload.clone();
+        it_runtime().block_on(async move {
+            let session = connect(input, secrets, IpcChannel::new(|_msg| Ok(())))
+                .await
+                .expect("connect failed");
+            let sftp = session.ensure_sftp().await.expect("open sftp");
+            let progress =
+                IpcChannel::<crate::modules::ssh::sftp::TransferProgress>::new(move |_| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
+            let got = crate::modules::ssh::sftp::ssh_sftp_download_inner(
+                &sftp,
+                blob_arg.clone(),
+                &progress,
+            )
+            .await
+            .expect("download failed");
+            assert!(
+                got == expected,
+                "downloaded bytes must match the remote file"
+            );
+            let err = crate::modules::ssh::sftp::ssh_sftp_download_inner(&sftp, sub_arg, &progress)
+                .await
+                .expect_err("a folder download must be refused");
+            assert!(err.contains("folder"), "{err}");
+            // A character device stats at 0 bytes and never ends.
+            let err = crate::modules::ssh::sftp::ssh_sftp_download_inner(
+                &sftp,
+                "/dev/zero".into(),
+                &progress,
+            )
+            .await
+            .expect_err("a device download must be refused");
+            assert!(err.contains("special file"), "{err}");
+            let err = crate::modules::ssh::sftp::ssh_sftp_rename_inner(&sftp, blob_arg, taken_arg)
+                .await
+                .expect_err("a move onto a taken name must be refused");
+            assert!(err.contains("already exists"), "{err}");
+            let err = crate::modules::ssh::sftp::ssh_sftp_rename_inner(&sftp, upper_arg, lower_arg)
+                .await
+                .expect_err("a move onto a case-differing sibling's taken name must be refused");
+            assert!(err.contains("already exists"), "{err}");
+            crate::modules::ssh::sftp::ssh_sftp_rename_inner(&sftp, loose_arg, moved_arg)
+                .await
+                .expect("plain move failed");
+            session.close().await;
+        });
+
+        assert!(
+            events.load(Ordering::SeqCst) >= 2,
+            "download must report progress"
+        );
+        assert_eq!(std::fs::read(&blob).unwrap(), payload, "source intact");
+        assert_eq!(
+            std::fs::read(sub.join("blob.bin")).unwrap(),
+            b"taken",
+            "target intact"
+        );
+        assert!(!loose.exists(), "moved file must leave its old path");
+        assert_eq!(std::fs::read(sub.join("loose.txt")).unwrap(), b"move me");
+        assert_eq!(
+            std::fs::read(sshd.dir.join("data/r.txt")).unwrap(),
+            b"lower"
+        );
+        eprintln!(
+            "[remote_dynamic_forward_tests] OK: sftp download byte-identical, folder refused, taken move refused, move landed"
+        );
     }
 }
