@@ -46,6 +46,11 @@ type Props = {
   /** Set by the SFTP tree. Hides actions that only make sense for a path on
    *  this machine, so a remote row never offers something guaranteed to fail. */
   remote?: boolean;
+  /** Remote tree only: Download… on a file row. */
+  onDownload?: (path: string) => void;
+  /** Remote tree only: Paste uploads the OS-copied files into this folder (a
+   *  file row: its parent). */
+  onPaste?: (dir: string) => void;
 };
 
 function FileTreeNodeImpl({
@@ -61,6 +66,8 @@ function FileTreeNodeImpl({
   selectedPath,
   onSelectPath,
   remote = false,
+  onDownload,
+  onPaste,
 }: Props) {
   const path = tree.joinPath(parentPath, entry.name);
   const isDir = entry.kind === "dir";
@@ -131,8 +138,9 @@ function FileTreeNodeImpl({
               // synthesized from `mousedown`/`mousemove`/`mouseup` by
               // `useTerminalFileDrop.ts::ensureFsDragListener`, which hit-
               // tests the source against `[data-fs-path]` and the target
-              // against `[data-terminal-leaf-id]`. See that file for the
-              // full rationale.
+              // against `[data-terminal-leaf-id]`, plus, for a Remote row,
+              // another Remote row or tree body (move) or a local folder row
+              // (download). See that file for the full rationale.
               data-fs-kind={entry.kind}
               onClick={handleNodeSelect}
               onDoubleClick={() => !isDir && tree.beginRename(path)}
@@ -209,6 +217,11 @@ function FileTreeNodeImpl({
               Open
             </ContextMenuItem>
           )}
+          {!isDir && onDownload && (
+            <ContextMenuItem className={COMPACT_ITEM} onSelect={() => onDownload(path)}>
+              Download…
+            </ContextMenuItem>
+          )}
           {isHtml && onPreviewInBrowser && (
             <ContextMenuItem className={COMPACT_ITEM} onSelect={() => onPreviewInBrowser(path)}>
               Open in Browser
@@ -239,6 +252,11 @@ function FileTreeNodeImpl({
           >
             New Folder
           </ContextMenuItem>
+          {onPaste && (
+            <ContextMenuItem className={COMPACT_ITEM} onSelect={() => onPaste(createTarget)}>
+              Paste
+            </ContextMenuItem>
+          )}
           <ContextMenuSeparator />
           <ContextMenuItem className={COMPACT_ITEM} onSelect={() => void copyToClipboard(path)}>
             Copy Path
@@ -364,6 +382,8 @@ function FileTreeNodeImpl({
             selectedPath={selectedPath}
             onSelectPath={onSelectPath}
             remote={remote}
+            onDownload={onDownload}
+            onPaste={onPaste}
           />
         ))}
     </>
