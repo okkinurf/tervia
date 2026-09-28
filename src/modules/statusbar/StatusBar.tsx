@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useState } from "react";
 import { IconTooltip } from "@/components/ui/icon-tooltip";
 import { RightSectionToggles } from "@/modules/rightPanel";
 import { useSshRightPanelStore } from "@/modules/ssh/sshRightPanelStore";
@@ -11,8 +11,8 @@ import { cn } from "@/lib/utils";
 import { IS_LINUX, IS_MAC, IS_WINDOWS } from "@/lib/platform";
 import { CwdBreadcrumb } from "./CwdBreadcrumb";
 import { ZoomControl } from "./ZoomControl";
-import { Server } from "lucide-react";
-import { SshResourceBar } from "@/modules/terminal/ResourceMonitor";
+import { Activity, Server } from "lucide-react";
+import { SshResourceBar } from "./ResourceMonitor";
 
 type Props = {
   cwd: string | null;
@@ -29,8 +29,6 @@ type Props = {
    *  the breadcrumb browse subfolders remotely instead of hitting the local
    *  filesystem with a remote path. */
   sshSessionId?: number | null;
-  /** Host label for the connected SSH session currently shown in the status bar. */
-  sshHostLabel?: string | null;
   /** ProxyJump chain of the active SSH leaf, when it has one. Takes the slot
    *  the local-OS badge vacates on an SSH pane, which is the honest thing to
    *  put there: what this shell is actually reached through. */
@@ -56,10 +54,10 @@ function StatusBarInner({
   hasAnySshLeaf,
   activeIsSsh,
   sshSessionId,
-  sshHostLabel,
   sshRoute,
 }: Props) {
   const compact = usePreferencesStore((s) => s.statusBarCompact);
+  const [resourceMonitorOpen, setResourceMonitorOpen] = useState(true);
 
   return (
     <footer className="border-border/60 bg-card/60 flex h-8 shrink-0 items-center justify-between gap-2 border-t px-3 text-[11px]">
@@ -86,8 +84,8 @@ function StatusBarInner({
           sshSessionId={sshSessionId}
         />
       </div>
-      {activeIsSsh && sshSessionId != null && (
-        <SshResourceBar sessionId={sshSessionId} hostLabel={sshHostLabel ?? null} />
+      {!compact && activeIsSsh && sshSessionId != null && resourceMonitorOpen && (
+        <SshResourceBar sessionId={sshSessionId} />
       )}
       {/* Left to right: the update prompt, the zoom pill, then the panel
           toggles you CLICK. Zoom is only on screen while zoomed, and that is
@@ -115,6 +113,27 @@ function StatusBarInner({
         <Group>
           {compact ? null : (
             <>
+              {activeIsSsh && sshSessionId != null && (
+                <IconTooltip
+                  label={`${resourceMonitorOpen ? "Hide" : "Show"} SSH resource monitor`}
+                  side="top"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setResourceMonitorOpen((open) => !open)}
+                    aria-label={`${resourceMonitorOpen ? "Hide" : "Show"} SSH resource monitor`}
+                    aria-pressed={resourceMonitorOpen}
+                    className={cn(
+                      "flex size-6 cursor-pointer items-center justify-center rounded-md transition-colors",
+                      resourceMonitorOpen
+                        ? "text-foreground bg-accent/60"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <Activity size={16} strokeWidth={1.75} className="shrink-0" />
+                  </button>
+                </IconTooltip>
+              )}
               <RightSectionToggles />
               <SshRightOpenButton hasAnySshLeaf={hasAnySshLeaf} />
             </>
