@@ -66,7 +66,39 @@ const sample = (over: Partial<SshResourceSample> = {}): SshResourceSample => ({
   check("CPU percentage", got.cpu, 80);
   check("network uses remote uptime delta", [got.rxRate, got.txRate], [1024, 1024]);
   check("disk I/O uses remote uptime delta", [got.diskReadRate, got.diskWriteRate], [1024, 1024]);
-  check("host metadata carries between initial-only fields", got.sample.hostname, "node-a");
+}
+
+{
+  const rootFs = [
+    {
+      source: "/dev/vda1",
+      mount: "/",
+      totalKib: 100,
+      usedKib: 25,
+      availableKib: 75,
+      usePercent: 25,
+    },
+  ];
+  const frames = [
+    sample({ hostname: "node-a", version: "Linux 6.8", uptimeSeconds: 100, filesystems: rootFs }),
+    sample({ hostname: null, version: null, uptimeSeconds: 101, filesystems: null }),
+    sample({ hostname: null, version: null, uptimeSeconds: 102, filesystems: null }),
+    sample({ hostname: null, version: null, uptimeSeconds: 103, filesystems: null }),
+  ];
+  let previous: SshResourceSample | null = null;
+  let latest: SshResourceSample | null = null;
+  for (const frame of frames) {
+    const derived = deriveResourceMetrics(frame, previous);
+    previous = derived.sample;
+    latest = derived.sample;
+  }
+  check("hostname survives four frames when sent once", latest?.hostname, "node-a");
+  check("version survives four frames when sent once", latest?.version, "Linux 6.8");
+  check(
+    "root filesystem survives four frames between 30s checks",
+    latest?.filesystems?.[0]?.mount,
+    "/",
+  );
 }
 
 {

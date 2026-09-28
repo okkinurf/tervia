@@ -9,7 +9,6 @@ import {
 } from "@/modules/terminal/lib/ssh-exit-decision";
 import type { SecretSource } from "@/modules/vault/resolve";
 import type { SshResourceSample } from "@/modules/statusbar/resourceMetrics";
-export type { SshResourceSample } from "@/modules/statusbar/resourceMetrics";
 
 export type SshResourceStreamStart = { streamId: number; pingEnabled: boolean };
 

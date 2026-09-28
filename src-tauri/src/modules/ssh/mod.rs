@@ -435,10 +435,18 @@ fn is_virtual_network_interface(name: &str) -> bool {
 }
 
 fn is_whole_disk(name: &str) -> bool {
-    name.starts_with("sd") && name[2..].chars().all(|c| c.is_ascii_lowercase())
-        || name.starts_with("vd") && name[2..].chars().all(|c| c.is_ascii_lowercase())
-        || name.starts_with("xvd") && name[3..].chars().all(|c| c.is_ascii_lowercase())
-        || name.starts_with("hd") && name[2..].chars().all(|c| c.is_ascii_lowercase())
+    name.starts_with("sd")
+        && !name[2..].is_empty()
+        && name[2..].chars().all(|c| c.is_ascii_lowercase())
+        || name.starts_with("vd")
+            && !name[2..].is_empty()
+            && name[2..].chars().all(|c| c.is_ascii_lowercase())
+        || name.starts_with("xvd")
+            && !name[3..].is_empty()
+            && name[3..].chars().all(|c| c.is_ascii_lowercase())
+        || name.starts_with("hd")
+            && !name[2..].is_empty()
+            && name[2..].chars().all(|c| c.is_ascii_lowercase())
         || name.strip_prefix("nvme").is_some_and(|part| {
             part.split_once('n').is_some_and(|(device, namespace)| {
                 !device.is_empty()
@@ -1160,19 +1168,11 @@ async fn shell_of(
 
 const RESOURCE_STREAM_BEGIN: &str = "__TERVIA_RESOURCE_BEGIN__";
 const RESOURCE_STREAM_END: &str = "__TERVIA_RESOURCE_END__";
-const RESOURCE_STREAM_SCRIPT: &str = r#"first=1;tick=0;while :; do
-printf '\n__TERVIA_RESOURCE_BEGIN__\n'
-if [ "$first" -eq 1 ]; then printf 'HOST\n'; hostname 2>/dev/null; printf 'VERSION\n'; uname -sr 2>/dev/null; first=0; fi
-awk 'BEGIN {
-printf "UPTIME\n"; if ((getline line < "/proc/uptime") > 0) { split(line, a); print a[1] } close("/proc/uptime")
-printf "CPU\n"; while ((getline line < "/proc/stat") > 0) { if (line ~ /^cpu /) { print line; break } } close("/proc/stat")
-printf "MEM\n"; while ((getline line < "/proc/meminfo") > 0) { if (line ~ /^(MemTotal|MemAvailable|Cached|Buffers):/) print line } close("/proc/meminfo")
-printf "NET\n"; n=0; while ((getline line < "/proc/net/dev") > 0) { if (++n > 2) print line } close("/proc/net/dev")
-printf "DISK\n"; while ((getline line < "/proc/diskstats") > 0) { sub(/^[ \t]+/, "", line); split(line, f, /[ \t]+/); name=f[3]; if (name ~ /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$/) print line } close("/proc/diskstats")
-}'
-if [ "$tick" -eq 0 ] && command -v timeout >/dev/null 2>&1; then printf 'FS\n'; timeout 3 df -Pk / 2>/dev/null; fi
-printf '__TERVIA_RESOURCE_END__\n'; tick=$(( (tick + 1) % 30 )); sleep 1 || exit 0
-done"#;
+const RESOURCE_STREAM_SCRIPT: &str = r#"first=1;tick=0;while :; do printf '\n__TERVIA_RESOURCE_BEGIN__\n'; if [ "$first" -eq 1 ]; then printf 'HOST\n'; hostname 2>/dev/null; printf 'VERSION\n'; uname -sr 2>/dev/null; first=0; fi; awk 'BEGIN { printf "UPTIME\n"; if ((getline line < "/proc/uptime") > 0) { split(line, a); print a[1] } close("/proc/uptime"); printf "CPU\n"; while ((getline line < "/proc/stat") > 0) { if (line ~ /^cpu /) { print line; break } } close("/proc/stat"); printf "MEM\n"; while ((getline line < "/proc/meminfo") > 0) { if (line ~ /^(MemTotal|MemAvailable|Cached|Buffers):/) print line } close("/proc/meminfo"); printf "NET\n"; n=0; while ((getline line < "/proc/net/dev") > 0) { if (++n > 2) print line } close("/proc/net/dev"); printf "DISK\n"; while ((getline line < "/proc/diskstats") > 0) { sub(/^[ \t]+/, "", line); split(line, f, /[ \t]+/); name=f[3]; if (name ~ /^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme[0-9]+n[0-9]+|mmcblk[0-9]+)$/) print line } close("/proc/diskstats") }'; if [ "$tick" -eq 0 ] && command -v timeout >/dev/null 2>&1; then printf 'FS\n'; timeout 3 df -Pk / 2>/dev/null; fi; printf '__TERVIA_RESOURCE_END__\n'; tick=$(( (tick + 1) % 30 )); sleep 1 || exit 0; done"#;
+
+fn resource_stream_command() -> String {
+    format!("sh -c {}", shell_quote(RESOURCE_STREAM_SCRIPT))
+}
 
 fn parse_resource_stream_chunk(
     pending: &mut String,
@@ -1229,10 +1229,19 @@ fn consume_resource_stream_chunk(
 fn parse_local_ping_latency(output: &str) -> Option<f64> {
     for line in output.lines() {
         let lowercase = line.to_lowercase();
-        let marker = ["time=", "time<", "время=", "время<"]
-            .iter()
-            .filter_map(|marker| lowercase.find(marker).map(|index| (index, *marker)))
-            .min_by_key(|(index, _)| *index);
+        let marker = [
+            "time=",
+            "time<",
+            "zeit=",
+            "zeit<",
+            "temps=",
+            "temps<",
+            "время=",
+            "время<",
+        ]
+        .iter()
+        .filter_map(|marker| lowercase.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index);
         let Some((start, marker)) = marker else {
             continue;
         };
@@ -1347,7 +1356,8 @@ async fn stream_local_ping(
 
 /// Start the optional remote sampler. The stream ID is minted by Rust and
 /// belongs to the SSH session, which keeps cancellation valid in release
-/// builds and makes the session the owner of its extra SSH channel.
+/// builds and makes the session the owner of its extra SSH channel. Platform,
+/// retry, and connection limits are documented in `KNOWN-LIMITS.md`.
 #[tauri::command]
 pub async fn ssh_resource_stream_start(
     state: tauri::State<'_, SshState>,
@@ -1367,12 +1377,10 @@ pub async fn ssh_resource_stream_start(
     let ping_cancel = cancel_rx.clone();
     let ping_host = session.target_host().to_string();
     let ping_channel = on_event.clone();
-    let stream_session = session.clone();
     ssh_runtime().spawn(async move {
         let ping_task = ping_enabled
             .then(|| ssh_runtime().spawn(stream_local_ping(ping_host, ping_cancel, ping_channel)));
-        let one_line_script = RESOURCE_STREAM_SCRIPT.replace('\n', " ");
-        let command = format!("sh -c {}", shell_quote(&one_line_script));
+        let command = resource_stream_command();
         let mut pending = String::new();
         let mut frame = None;
         let result = session
@@ -1381,14 +1389,13 @@ pub async fn ssh_resource_stream_start(
             })
             .await;
 
-        stream_session.stop_resource_stream(stream_id);
+        session.stop_resource_stream(stream_id);
         if let Some(ping_task) = ping_task {
             let _ = ping_task.await;
         }
         if let Err(error) = result {
             let _ = on_event.send(SshResourceStreamEvent::Error { message: error });
         }
-        stream_session.finish_resource_stream(stream_id);
     });
     Ok(SshResourceStreamStart {
         stream_id,
@@ -1956,11 +1963,15 @@ pub async fn ssh_git(
 #[cfg(test)]
 mod tests {
     use super::{
-        last_line, parse_local_ping_latency, parse_resource_sample, parse_resource_stream_chunk,
-        shell_quote, ssh_key_classify_inner, ssh_key_generate_inner, ssh_key_inspect_inner,
-        SshTextClassification, SysRng, UnwrapErr, ERR_EMPTY, ERR_OPENSSH_BODY,
-        ERR_PASSPHRASE_OR_CORRUPT, ERR_UNKNOWN, ERR_UNREADABLE, ERR_WRONG_PASSPHRASE,
+        is_whole_disk, last_line, parse_local_ping_latency, parse_resource_sample,
+        parse_resource_stream_chunk, shell_quote, ssh_key_classify_inner, ssh_key_generate_inner,
+        ssh_key_inspect_inner, SshTextClassification, SysRng, UnwrapErr, ERR_EMPTY,
+        ERR_OPENSSH_BODY, ERR_PASSPHRASE_OR_CORRUPT, ERR_UNKNOWN, ERR_UNREADABLE,
+        ERR_WRONG_PASSPHRASE,
     };
+
+    #[cfg(unix)]
+    use super::resource_stream_command;
 
     /// `ssh-keygen -t ed25519 -N '' -C tervia-test@localhost`.
     const PLAIN_ED25519: &str = "\
@@ -2780,6 +2791,16 @@ Ym9ndXMgYm9keSwgbmV2ZXIgcmVhY2hlZA==
     }
 
     #[test]
+    fn whole_disk_filter_matches_sampler_device_families() {
+        assert!(is_whole_disk("sda"));
+        assert!(is_whole_disk("xvdb"));
+        assert!(is_whole_disk("nvme0n1"));
+        assert!(is_whole_disk("mmcblk0"));
+        assert!(!is_whole_disk("sd"));
+        assert!(!is_whole_disk("sda1"));
+    }
+
+    #[test]
     fn missing_mem_available_does_not_discard_other_metrics() {
         let sample = parse_resource_sample(
             "CPU\ncpu 1 2 3 4 5\nMEM\nMemTotal: 1024 kB\nNET\neth0: 1 0 0 0 0 0 0 0 2 0 0 0 0 0 0 0\n",
@@ -2871,7 +2892,7 @@ Ym9ndXMgYm9keSwgbmV2ZXIgcmVhY2hlZA==
     }
 
     #[test]
-    fn local_ping_parser_uses_latency_field_and_accepts_russian_windows_output() {
+    fn local_ping_parser_accepts_common_localized_windows_output() {
         assert_eq!(
             parse_local_ping_latency("64 bytes from app2ms.example.com: time=3.25 ms"),
             Some(3.25)
@@ -2883,6 +2904,72 @@ Ym9ndXMgYm9keSwgbmV2ZXIgcmVhY2hlZA==
         assert_eq!(
             parse_local_ping_latency("app2ms.example.com unreachable"),
             None
+        );
+        assert_eq!(
+            parse_local_ping_latency("Antwort von 192.0.2.1: Zeit=2 ms"),
+            Some(2.0)
+        );
+        assert_eq!(
+            parse_local_ping_latency("Réponse de 192.0.2.1: temps=2,5 ms"),
+            Some(2.5)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_stream_command_emits_a_parseable_linux_sample() {
+        use std::{
+            io::Read,
+            process::{Command, Stdio},
+            sync::mpsc,
+            thread,
+            time::Duration,
+        };
+
+        if !std::path::Path::new("/proc/stat").exists() {
+            return;
+        }
+
+        let command = resource_stream_command();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the resource stream command through sh -c");
+        let mut stdout = child.stdout.take().expect("capture resource stream stdout");
+        let (sample_tx, sample_rx) = mpsc::channel();
+
+        let reader = thread::spawn(move || {
+            let mut pending = String::new();
+            let mut frame = None;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let size = match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(size) => size,
+                };
+                if let Ok(samples) =
+                    parse_resource_stream_chunk(&mut pending, &mut frame, &chunk[..size])
+                {
+                    if let Some(sample) = samples.into_iter().next() {
+                        let _ = sample_tx.send(sample);
+                        return;
+                    }
+                }
+            }
+        });
+
+        let sample = sample_rx.recv_timeout(Duration::from_secs(6));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+
+        let sample = sample.expect("sampler should emit a frame within six seconds");
+        assert!(
+            sample.cpu_total.is_some(),
+            "sampler frame did not contain Linux CPU counters: {sample:?}"
         );
     }
 }

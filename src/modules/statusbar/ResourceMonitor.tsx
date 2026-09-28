@@ -7,6 +7,7 @@ import {
   startSshResourceStream,
   stopSshResourceStream,
   type SshResourceStreamEvent,
+  type SshResourceStreamStart,
 } from "@/modules/ssh/bridge";
 import {
   deriveResourceMetrics,
@@ -15,6 +16,36 @@ import {
 } from "./resourceMetrics";
 
 type Metrics = ResourceMetrics;
+
+const pendingResourceStreamStarts = new Map<number, Promise<void>>();
+
+async function startQueuedResourceStream(
+  sessionId: number,
+  onEvent: (event: SshResourceStreamEvent) => void,
+  isActive: () => boolean,
+): Promise<SshResourceStreamStart | null> {
+  const previous = pendingResourceStreamStarts.get(sessionId) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  pendingResourceStreamStarts.set(sessionId, current);
+  await previous.catch(() => undefined);
+  try {
+    if (!isActive()) return null;
+    const result = await startSshResourceStream(sessionId, onEvent);
+    if (!isActive()) {
+      await stopSshResourceStream(sessionId, result.streamId).catch(() => undefined);
+      return null;
+    }
+    return result;
+  } finally {
+    release();
+    if (pendingResourceStreamStarts.get(sessionId) === current) {
+      pendingResourceStreamStarts.delete(sessionId);
+    }
+  }
+}
 
 function formatNetwork(bytesPerSecond: number | null): string {
   return bytesPerSecond === null
@@ -216,7 +247,7 @@ function FilesystemDetails({ filesystems }: { filesystems: SshResourceSample["fi
 
 type StreamStatus = "connecting" | "live" | "stale" | "unavailable";
 
-/** Optional, compact SSH telemetry strip; platform and ping limits are in
+/** Optional SSH telemetry strip; platform and ping limits are in
  * `KNOWN-LIMITS.md`. */
 export function SshResourceBar({ sessionId }: { sessionId: number }) {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
@@ -241,7 +272,7 @@ export function SshResourceBar({ sessionId }: { sessionId: number }) {
     setPingEnabled(true);
 
     const scheduleRetry = () => {
-      if (!active || retryTimer) return;
+      if (!active || retryTimer || !previous) return;
       const delay = Math.min(3000 * 2 ** retryAttempt, 30_000);
       retryAttempt++;
       retryTimer = setTimeout(() => {
@@ -256,13 +287,22 @@ export function SshResourceBar({ sessionId }: { sessionId: number }) {
         return;
       }
       if (event.type === "error") {
+        if (staleTimer) {
+          clearTimeout(staleTimer);
+          staleTimer = undefined;
+        }
         setStreamError(event.message);
-        setStreamStatus("unavailable");
-        scheduleRetry();
+        if (previous) {
+          setStreamStatus("stale");
+          scheduleRetry();
+        } else {
+          setStreamStatus("unavailable");
+        }
         return;
       }
-      setMetrics(deriveResourceMetrics(event.sample, previous));
-      previous = event.sample;
+      const nextMetrics = deriveResourceMetrics(event.sample, previous);
+      setMetrics(nextMetrics);
+      previous = nextMetrics.sample;
       retryAttempt = 0;
       setStreamError(null);
       setStreamStatus("live");
@@ -275,18 +315,19 @@ export function SshResourceBar({ sessionId }: { sessionId: number }) {
       if (!active) return;
       setStreamStatus((status) => (status === "live" ? "stale" : "connecting"));
       try {
-        const result = await startSshResourceStream(sessionId, handleEvent);
-        if (!active) {
-          await stopSshResourceStream(sessionId, result.streamId).catch(() => undefined);
-          return;
-        }
+        const result = await startQueuedResourceStream(sessionId, handleEvent, () => active);
+        if (!result || !active) return;
         streamId = result.streamId;
         setPingEnabled(result.pingEnabled);
       } catch (cause) {
         if (!active) return;
         setStreamError(cause instanceof Error ? cause.message : String(cause));
-        setStreamStatus("unavailable");
-        scheduleRetry();
+        if (previous) {
+          setStreamStatus("stale");
+          scheduleRetry();
+        } else {
+          setStreamStatus("unavailable");
+        }
       }
     };
     void start();
@@ -305,7 +346,7 @@ export function SshResourceBar({ sessionId }: { sessionId: number }) {
       : streamStatus === "stale"
         ? "Stale"
         : streamStatus === "unavailable"
-          ? "Unavailable · retrying"
+          ? "Unavailable"
           : "Connecting";
 
   return (

@@ -1,11 +1,11 @@
-import { memo, useState } from "react";
+import { memo } from "react";
 import { IconTooltip } from "@/components/ui/icon-tooltip";
 import { RightSectionToggles } from "@/modules/rightPanel";
 import { useSshRightPanelStore } from "@/modules/ssh/sshRightPanelStore";
 import { SshRoutePill } from "@/modules/ssh/SshRoutePill";
 import type { SshRouteHop } from "@/modules/ssh/status";
 import { usePreferencesStore } from "@/modules/settings/preferences";
-import { setStatusBarCompact } from "@/modules/settings/store";
+import { setStatusBarCompact, setStatusBarResourceMonitor } from "@/modules/settings/store";
 import { UpdaterPill } from "@/modules/updater";
 import { cn } from "@/lib/utils";
 import { IS_LINUX, IS_MAC, IS_WINDOWS } from "@/lib/platform";
@@ -57,14 +57,16 @@ function StatusBarInner({
   sshRoute,
 }: Props) {
   const compact = usePreferencesStore((s) => s.statusBarCompact);
-  const [resourceMonitorOpen, setResourceMonitorOpen] = useState(true);
+  const resourceMonitorOpen = usePreferencesStore((s) => s.statusBarResourceMonitor);
+  const showResourceMonitor =
+    !compact && activeIsSsh && sshSessionId != null && resourceMonitorOpen;
 
   return (
     <footer className="border-border/60 bg-card/60 flex h-8 shrink-0 items-center justify-between gap-2 border-t px-3 text-[11px]">
       <div
         className={cn(
           "flex min-w-0 items-center gap-1.5 truncate",
-          activeIsSsh && sshSessionId != null ? "max-w-[32%] flex-[0_1_32%]" : "flex-1",
+          showResourceMonitor ? "max-w-[32%] flex-[0_1_32%]" : "flex-1",
         )}
       >
         {/* One slot, two readings of "where am I". A jump chain wins whenever
@@ -84,9 +86,7 @@ function StatusBarInner({
           sshSessionId={sshSessionId}
         />
       </div>
-      {!compact && activeIsSsh && sshSessionId != null && resourceMonitorOpen && (
-        <SshResourceBar sessionId={sshSessionId} />
-      )}
+      {showResourceMonitor && sshSessionId != null && <SshResourceBar sessionId={sshSessionId} />}
       {/* Left to right: the update prompt, the zoom pill, then the panel
           toggles you CLICK. Zoom is only on screen while zoomed, and that is
           where it is wanted. Compact mode keeps only what you glance at - the
@@ -120,7 +120,7 @@ function StatusBarInner({
                 >
                   <button
                     type="button"
-                    onClick={() => setResourceMonitorOpen((open) => !open)}
+                    onClick={() => void setStatusBarResourceMonitor(!resourceMonitorOpen)}
                     aria-label={`${resourceMonitorOpen ? "Hide" : "Show"} SSH resource monitor`}
                     aria-pressed={resourceMonitorOpen}
                     className={cn(

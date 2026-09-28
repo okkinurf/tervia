@@ -941,6 +941,7 @@ impl SshSession {
     }
 
     /// Begin the session's single resource stream and cancel any previous one.
+    /// See the resource-monitor constraints in `KNOWN-LIMITS.md`.
     pub fn begin_resource_stream(&self) -> Result<(u32, watch::Receiver<bool>), String> {
         let stream_id = self.resource_stream_seq.fetch_add(1, Ordering::Relaxed);
         let (cancel, receiver) = watch::channel(false);
@@ -964,19 +965,6 @@ impl SshSession {
                 if let Some((_, cancel)) = stream.take() {
                     let _ = cancel.send(true);
                 }
-            }
-        }
-    }
-
-    /// Release the sampler slot after it ends naturally, without touching a
-    /// newer stream that may have replaced it while this task was unwinding.
-    pub fn finish_resource_stream(&self, stream_id: u32) {
-        if let Ok(mut stream) = self.resource_stream.lock() {
-            if stream
-                .as_ref()
-                .is_some_and(|(active_id, _)| *active_id == stream_id)
-            {
-                stream.take();
             }
         }
     }
@@ -1235,14 +1223,8 @@ impl SshSession {
         Ok(sftp)
     }
 
-    /// Run one non-interactive command on the remote and capture its stdout.
-    /// Opens a one-shot channel on the retained handle, the same way
-    /// `open_sftp_on_handle` does, so it is independent of the shell channel
-    /// driving the terminal.
-    ///
-    /// Open a session channel and request remote command execution. Shared by
-    /// bounded captures and persistent streams so both handle exec rejection
-    /// and a server that never replies during channel setup.
+    /// Open a session channel and request remote command execution, with
+    /// bounded channel-open and exec-request deadlines.
     async fn open_exec_channel(
         &self,
         cmd: &str,
@@ -1271,6 +1253,11 @@ impl SshSession {
         Ok(channel)
     }
 
+    /// Run one non-interactive command on the remote and capture its stdout.
+    /// Opens a one-shot channel on the retained handle, the same way
+    /// `open_sftp_on_handle` does, so it is independent of the shell channel
+    /// driving the terminal.
+    ///
     /// A non-zero exit is an `Err` carrying the remote's stderr. Swallowing it
     /// made every remote failure - `git` missing from sshd's minimal PATH,
     /// dubious-ownership, a denied exec - indistinguishable from "empty output",
@@ -1320,6 +1307,9 @@ impl SshSession {
                         }
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => exit = exit_status,
+                    Some(ChannelMsg::Failure) => {
+                        return Err("ssh server rejected the exec request".to_string());
+                    }
                     // A signal death arrives as exit-signal, NOT exit-status
                     // (RFC 4254 6.10 - a server sends one or the other), so
                     // without this `exit` would stay 0 and a truncated read
@@ -1439,9 +1429,6 @@ impl SshSession {
                     Some(ChannelMsg::Failure) => {
                         let _ = channel.close().await;
                         return Err("ssh server rejected the resource stream exec request".to_string());
-                    }
-                    Some(ChannelMsg::OpenFailure(reason)) => {
-                        return Err(format!("ssh resource stream channel open failed: {reason:?}"));
                     }
                     Some(ChannelMsg::Close) | None => break,
                     _ => {}

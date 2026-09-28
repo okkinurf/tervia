@@ -23,7 +23,9 @@ the same change that lifts it.
   disk I/O covers common whole-disk device names, network totals exclude
   common virtual interfaces, and root filesystem usage is checked every 30
   seconds only when `timeout` is installed. The optional strip uses one
-  persistent exec channel and can be hidden. `src-tauri/src/modules/ssh/mod.rs`
+  persistent exec channel and can be hidden. A stream that fails before its
+  first sample stays unavailable without automatic retries; streams that go
+  stale after becoming live retry with backoff. `src-tauri/src/modules/ssh/mod.rs`
   (`ssh_resource_stream_start`, `parse_resource_sample`),
   `src/modules/statusbar/ResourceMonitor.tsx`.
   Changes when: non-Linux metrics or additional Linux disk/network device

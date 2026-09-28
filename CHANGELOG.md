@@ -10,7 +10,7 @@ The latest release only. Every earlier version:
 
 **SSH**
 
-- The status bar can show live Linux host CPU, RAM, network, disk I/O, root filesystem usage, uptime and local ping. The monitor can be hidden while connected.
+- The status bar can show live Linux host CPU, RAM, network, disk I/O, root filesystem usage, uptime and local ping. Its visibility choice is remembered across launches.
 
 ### Fixed
 
