@@ -9,6 +9,62 @@ import {
 } from "@/modules/terminal/lib/ssh-exit-decision";
 import type { SecretSource } from "@/modules/vault/resolve";
 
+export type SshResourceSample = {
+  hostname: string;
+  version: string;
+  uptimeSeconds: number;
+  cpuTotal: number;
+  cpuIdle: number;
+  memoryTotal: number;
+  memoryAvailable: number;
+  memoryCached: number;
+  memoryBuffers: number;
+  filesystems: {
+    source: string;
+    mount: string;
+    totalKib: number;
+    usedKib: number;
+    availableKib: number;
+    usePercent: number;
+  }[];
+  networkInterfaces: {
+    name: string;
+    receivedBytes: number;
+    receivedErrors: number;
+    receivedDropped: number;
+    sentBytes: number;
+    sentErrors: number;
+    sentDropped: number;
+  }[];
+};
+
+export type SshResourceStreamEvent =
+  | { type: "sample"; sample: SshResourceSample }
+  | { type: "ping"; host: string; latencyMs: number | null }
+  | { type: "error"; message: string };
+
+export function readSshResourceSample(sessionId: number): Promise<SshResourceSample> {
+  return invoke<SshResourceSample>("ssh_resource_sample", { id: sessionId });
+}
+
+export function startSshResourceStream(
+  sessionId: number,
+  streamId: string,
+  onEvent: (event: SshResourceStreamEvent) => void,
+): Promise<void> {
+  const channel = new Channel<SshResourceStreamEvent>();
+  channel.onmessage = onEvent;
+  return invoke("ssh_resource_stream_start", {
+    id: sessionId,
+    streamId,
+    onEvent: channel,
+  });
+}
+
+export function stopSshResourceStream(sessionId: number, streamId: string): Promise<void> {
+  return invoke("ssh_resource_stream_stop", { id: sessionId, streamId });
+}
+
 /** First-connect host-key confirmation request from the backend. */
 export type SshHostKeyPrompt = { promptId: string; fingerprint: string; host: string };
 

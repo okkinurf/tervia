@@ -17,7 +17,7 @@ use russh::{ChannelMsg, ChannelWriteHalf, Disconnect};
 use russh_sftp::client::SftpSession;
 use serde::Serialize;
 use tauri::ipc::Channel as IpcChannel;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
@@ -645,6 +645,11 @@ impl SshShell {
 }
 
 impl SshSession {
+    /// The configured SSH target, used for a local-to-remote ICMP measurement.
+    pub(super) fn target_host(&self) -> &str {
+        &self.host
+    }
+
     /// Take the one-shot session-end receiver out of the session. Called once
     /// by `ssh_open` to wire up the janitor task; subsequent callers get
     /// `None`.
@@ -1277,6 +1282,84 @@ impl SshSession {
             });
         }
         Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Keep one exec channel open and forward each stdout chunk until the
+    /// caller cancels it or the remote command ends. This is for remote
+    /// streams such as resource monitoring; one-shot commands should keep
+    /// using `exec_capture` so their output stays bounded.
+    pub async fn exec_stream<F>(
+        &self,
+        cmd: &str,
+        mut cancel: watch::Receiver<bool>,
+        mut on_data: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&[u8]) -> Result<(), String> + Send,
+    {
+        let mut channel = {
+            let handle_guard = self.handle.lock().await;
+            let handle = handle_guard
+                .as_ref()
+                .ok_or_else(|| "ssh session is closed".to_string())?;
+            handle
+                .channel_open_session()
+                .await
+                .map_err(|e| format!("ssh: open resource stream channel failed: {e}"))?
+        };
+        channel
+            .exec(true, cmd)
+            .await
+            .map_err(|e| format!("ssh: start resource stream failed: {e}"))?;
+
+        const ERR_CAP: usize = 4096;
+        let mut err = Vec::new();
+        let mut exit = None;
+        loop {
+            tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        let _ = channel.close().await;
+                        return Ok(());
+                    }
+                }
+                msg = channel.wait() => match msg {
+                    Some(ChannelMsg::Data { ref data }) => {
+                        if let Err(error) = on_data(data) {
+                            let _ = channel.close().await;
+                            return Err(error);
+                        }
+                    }
+                    Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
+                        err.extend_from_slice(data);
+                        if err.len() > ERR_CAP {
+                            err.drain(..err.len() - ERR_CAP);
+                        }
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => exit = Some(exit_status),
+                    Some(ChannelMsg::ExitSignal { ref signal_name, .. }) => {
+                        exit = Some(128);
+                        if err.is_empty() {
+                            err.extend_from_slice(
+                                format!("killed by signal {signal_name:?}").as_bytes(),
+                            );
+                        }
+                    }
+                    Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                },
+            }
+        }
+
+        let detail = String::from_utf8_lossy(&err);
+        let detail = detail.trim();
+        match exit {
+            Some(code) if code != 0 && !detail.is_empty() => {
+                Err(format!("ssh resource stream ({code}): {detail}"))
+            }
+            Some(code) if code != 0 => Err(format!("ssh resource stream exited {code}")),
+            _ => Err("ssh resource stream ended".to_string()),
+        }
     }
 }
 

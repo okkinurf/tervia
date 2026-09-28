@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::AppHandle;
 use tokio::runtime::Runtime;
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use crate::modules::secrets::{SecretSource, SecretsState};
@@ -56,13 +57,20 @@ pub struct SshState {
     /// janitor task spawned per session can hold a handle for eviction
     /// after the session's connection ends.
     pub(crate) sessions: Arc<tokio::sync::RwLock<HashMap<u32, Arc<SshSession>>>>,
+    resource_streams: Arc<tokio::sync::Mutex<HashMap<(u32, String), SshResourceStreamTask>>>,
     next_id: AtomicU32,
+}
+
+struct SshResourceStreamTask {
+    cancel: watch::Sender<bool>,
+    identity: Arc<()>,
 }
 
 impl Default for SshState {
     fn default() -> Self {
         Self {
             sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            resource_streams: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next_id: AtomicU32::new(1),
         }
     }
@@ -145,6 +153,224 @@ pub struct SshOpenInput {
 pub struct SshOpened {
     pub id: u32,
     pub fingerprint: String,
+}
+
+/// Cumulative counters and current capacities from one Linux SSH host sample.
+/// The frontend derives rates from consecutive samples so polling stays stateless.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshResourceSample {
+    pub hostname: String,
+    pub version: String,
+    pub uptime_seconds: f64,
+    pub cpu_total: u64,
+    pub cpu_idle: u64,
+    pub memory_total: u64,
+    pub memory_available: u64,
+    pub memory_cached: u64,
+    pub memory_buffers: u64,
+    pub filesystems: Vec<SshFilesystemUsage>,
+    pub network_interfaces: Vec<SshNetworkInterface>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshFilesystemUsage {
+    pub source: String,
+    pub mount: String,
+    pub total_kib: u64,
+    pub used_kib: u64,
+    pub available_kib: u64,
+    pub use_percent: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshNetworkInterface {
+    pub name: String,
+    pub received_bytes: u64,
+    pub received_errors: u64,
+    pub received_dropped: u64,
+    pub sent_bytes: u64,
+    pub sent_errors: u64,
+    pub sent_dropped: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SshResourceStreamEvent {
+    Sample {
+        sample: SshResourceSample,
+    },
+    Ping {
+        host: String,
+        latency_ms: Option<f64>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+fn parse_resource_sample(raw: &str) -> Result<SshResourceSample, String> {
+    let mut hostname = None;
+    let mut version = None;
+    let mut uptime_seconds = None;
+    let mut cpu = None;
+    let mut memory_total = None;
+    let mut memory_available = None;
+    let mut memory_cached = None;
+    let mut memory_buffers = None;
+    let mut filesystems = Vec::new();
+    let mut network_interfaces = Vec::new();
+    let mut section = "";
+
+    for line in raw.lines() {
+        let line = line.trim();
+        match line {
+            "HOST" => {
+                section = "host";
+                continue;
+            }
+            "VERSION" => {
+                section = "version";
+                continue;
+            }
+            "UPTIME" => {
+                section = "uptime";
+                continue;
+            }
+            "CPU" => {
+                section = "cpu";
+                continue;
+            }
+            "MEM" => {
+                section = "memory";
+                continue;
+            }
+            "NET" => {
+                section = "network";
+                continue;
+            }
+            "FS" => {
+                section = "filesystems";
+                continue;
+            }
+            _ => {}
+        }
+
+        match section {
+            "host" => {
+                hostname = Some(line.to_string());
+                section = "";
+            }
+            "version" => {
+                version = Some(line.to_string());
+                section = "";
+            }
+            "uptime" => {
+                uptime_seconds = line
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<f64>().ok());
+                section = "";
+            }
+            "cpu" if line.starts_with("cpu ") => {
+                let values = line
+                    .split_whitespace()
+                    .skip(1)
+                    .map(str::parse::<u64>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| "ssh resources: invalid CPU counters".to_string())?;
+                if values.len() >= 5 {
+                    // Guest time is already included in user/nice, so only sum
+                    // the first eight Linux CPU counters.
+                    cpu = Some((
+                        values.iter().take(8).sum(),
+                        values[3].saturating_add(values[4]),
+                    ));
+                }
+            }
+            "memory" => {
+                if let Some(value) = line.strip_prefix("MemTotal:") {
+                    memory_total = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                } else if let Some(value) = line.strip_prefix("MemAvailable:") {
+                    memory_available = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                } else if let Some(value) = line.strip_prefix("Cached:") {
+                    memory_cached = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                } else if let Some(value) = line.strip_prefix("Buffers:") {
+                    memory_buffers = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                }
+            }
+            "network" => {
+                if let Some((name, counters)) = line.split_once(':') {
+                    let name = name.trim();
+                    if name != "lo" {
+                        let fields = counters
+                            .split_whitespace()
+                            .map(str::parse::<u64>)
+                            .collect::<Result<Vec<_>, _>>();
+                        if let Ok(fields) = fields {
+                            if fields.len() >= 16 {
+                                network_interfaces.push(SshNetworkInterface {
+                                    name: name.to_string(),
+                                    received_bytes: fields[0],
+                                    received_errors: fields[2],
+                                    received_dropped: fields[3],
+                                    sent_bytes: fields[8],
+                                    sent_errors: fields[10],
+                                    sent_dropped: fields[11],
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "filesystems" if !line.starts_with("Filesystem") => {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                if fields.len() >= 6 {
+                    if let (Ok(total), Ok(used), Ok(available), Ok(use_percent)) = (
+                        fields[1].parse(),
+                        fields[2].parse(),
+                        fields[3].parse(),
+                        fields[4].trim_end_matches('%').parse(),
+                    ) {
+                        filesystems.push(SshFilesystemUsage {
+                            source: fields[0].to_string(),
+                            mount: fields[5..].join(" "),
+                            total_kib: total,
+                            used_kib: used,
+                            available_kib: available,
+                            use_percent,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (cpu_total, cpu_idle) = cpu.ok_or_else(|| {
+        "Resource metrics are unavailable: this SSH host must be Linux with /proc.".to_string()
+    })?;
+    Ok(SshResourceSample {
+        hostname: hostname.ok_or_else(|| "ssh resources: hostname unavailable".to_string())?,
+        version: version.unwrap_or_default(),
+        uptime_seconds: uptime_seconds.unwrap_or_default(),
+        cpu_total,
+        cpu_idle,
+        memory_total: memory_total
+            .ok_or_else(|| "ssh resources: MemTotal unavailable".to_string())?,
+        memory_available: memory_available
+            .ok_or_else(|| "ssh resources: MemAvailable unavailable".to_string())?,
+        memory_cached: memory_cached.unwrap_or_default(),
+        memory_buffers: memory_buffers.unwrap_or_default(),
+        filesystems,
+        network_interfaces,
+    })
 }
 
 /// One hop's secrets, read out of the keychain at the command boundary.
@@ -853,6 +1079,268 @@ async fn shell_of(
     })
 }
 
+/// Read one Linux host metrics sample. Kept available for on-demand callers;
+/// the status bar uses the persistent stream below instead of reopening a
+/// short-lived exec channel for each refresh.
+#[tauri::command]
+pub async fn ssh_resource_sample(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+) -> Result<SshResourceSample, String> {
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "no SSH session".to_string())?;
+    let command = r#"printf 'HOST\n'; cat /proc/sys/kernel/hostname; printf 'VERSION\n'; cat /proc/version; printf 'UPTIME\n'; cat /proc/uptime; printf 'CPU\n'; grep '^cpu ' /proc/stat; printf 'MEM\n'; grep -E '^(MemTotal|MemAvailable|Cached|Buffers):' /proc/meminfo; printf 'NET\n'; cat /proc/net/dev; printf 'FS\n'; df -Pk 2>/dev/null || true"#;
+    let raw = session.exec_capture(command).await?;
+    parse_resource_sample(&raw)
+}
+
+const RESOURCE_STREAM_BEGIN: &str = "__TERVIA_RESOURCE_BEGIN__";
+const RESOURCE_STREAM_END: &str = "__TERVIA_RESOURCE_END__";
+const RESOURCE_STREAM_SCRIPT: &str = r#"while :; do
+printf '\n__TERVIA_RESOURCE_BEGIN__\n'
+printf 'HOST\n'; cat /proc/sys/kernel/hostname
+printf 'VERSION\n'; cat /proc/version
+printf 'UPTIME\n'; cat /proc/uptime
+printf 'CPU\n'; grep '^cpu ' /proc/stat
+printf 'MEM\n'; grep -E '^(MemTotal|MemAvailable|Cached|Buffers):' /proc/meminfo
+printf 'NET\n'; cat /proc/net/dev
+printf 'FS\n'; df -Pk 2>/dev/null || true
+printf '__TERVIA_RESOURCE_END__\n'
+sleep 1 || exit 0
+done"#;
+
+fn consume_resource_stream_chunk(
+    pending: &mut String,
+    frame: &mut Option<String>,
+    chunk: &[u8],
+    on_event: &Channel<SshResourceStreamEvent>,
+) -> Result<(), String> {
+    const FRAME_CAP: usize = 4 * 1024 * 1024;
+    pending.push_str(&String::from_utf8_lossy(chunk));
+    if pending.len() > FRAME_CAP && !pending.contains('\n') {
+        return Err("ssh resource stream line exceeded 4 MiB".to_string());
+    }
+
+    while let Some(newline) = pending.find('\n') {
+        let line = pending[..newline].trim_end_matches('\r').to_string();
+        pending.drain(..=newline);
+        if line == RESOURCE_STREAM_BEGIN {
+            *frame = Some(String::new());
+        } else if line == RESOURCE_STREAM_END {
+            if let Some(raw) = frame.take() {
+                let sample = parse_resource_sample(&raw)?;
+                on_event
+                    .send(SshResourceStreamEvent::Sample { sample })
+                    .map_err(|error| format!("ssh resource IPC channel failed: {error}"))?;
+            }
+        } else if let Some(raw) = frame.as_mut() {
+            raw.push_str(&line);
+            raw.push('\n');
+            if raw.len() > FRAME_CAP {
+                return Err("ssh resource sample exceeded 4 MiB".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_local_ping_latency(output: &str) -> Option<f64> {
+    for line in output.lines() {
+        let lowercase = line.to_ascii_lowercase();
+        let Some(ms_at) = lowercase.find("ms") else {
+            continue;
+        };
+        let before_unit = lowercase[..ms_at].trim_end();
+        let mut value_start = before_unit.len();
+        for (index, character) in before_unit.char_indices().rev() {
+            if character.is_ascii_digit() || matches!(character, '.' | ',') {
+                value_start = index;
+            } else {
+                break;
+            }
+        }
+        if value_start == before_unit.len() {
+            continue;
+        }
+        let value = before_unit[value_start..].replace(',', ".");
+        let milliseconds = value.parse::<f64>().ok()?;
+        return Some(if before_unit[..value_start].trim_end().ends_with('<') {
+            0.5
+        } else {
+            milliseconds
+        });
+    }
+    None
+}
+
+fn run_local_ping(host: &str) -> Option<f64> {
+    if host.is_empty() || host.starts_with('-') || host.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let mut command = std::process::Command::new("ping");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        command.args(["-n", "1", "-w", "1000"]);
+    }
+    #[cfg(target_os = "macos")]
+    command.args(["-n", "-c", "1", "-W", "1000"]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    command.args(["-n", "-c", "1", "-W", "1"]);
+    #[cfg(not(any(unix, target_os = "windows")))]
+    return None;
+
+    let mut child = command
+        .arg(host)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let started_at = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child.wait_with_output().ok()?;
+                if !status.success() {
+                    return None;
+                }
+                return parse_local_ping_latency(&String::from_utf8_lossy(&output.stdout));
+            }
+            Ok(None) if started_at.elapsed() < std::time::Duration::from_millis(1500) => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+async fn stream_local_ping(
+    host: String,
+    mut cancel: watch::Receiver<bool>,
+    on_event: Channel<SshResourceStreamEvent>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                let target = host.clone();
+                let ping = tokio::task::spawn_blocking(move || run_local_ping(&target));
+                let latency_ms = tokio::select! {
+                    changed = cancel.changed() => {
+                        if changed.is_err() || *cancel.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                    result = ping => result.ok().flatten(),
+                };
+                if on_event.send(SshResourceStreamEvent::Ping {
+                    host: host.clone(),
+                    latency_ms,
+                }).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Start a persistent remote sampler. The remote sh process writes framed
+/// samples over one SSH exec channel every second; the interactive terminal
+/// remains on its own channel.
+#[tauri::command]
+pub async fn ssh_resource_stream_start(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    stream_id: String,
+    on_event: Channel<SshResourceStreamEvent>,
+) -> Result<(), String> {
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "no SSH session".to_string())?;
+
+    let key = (id, stream_id);
+    let (cancel, cancel_rx) = watch::channel(false);
+    let ping_cancel = cancel.subscribe();
+    let stop_ping = cancel.clone();
+    let identity = Arc::new(());
+    let previous = state.resource_streams.lock().await.insert(
+        key.clone(),
+        SshResourceStreamTask {
+            cancel,
+            identity: identity.clone(),
+        },
+    );
+    if let Some(previous) = previous {
+        let _ = previous.cancel.send(true);
+    }
+
+    let streams = state.resource_streams.clone();
+    let ping_host = session.target_host().to_string();
+    let ping_channel = on_event.clone();
+    ssh_runtime().spawn(async move {
+        let ping_task =
+            ssh_runtime().spawn(stream_local_ping(ping_host, ping_cancel, ping_channel));
+        let command = format!("sh -c {}", shell_quote(RESOURCE_STREAM_SCRIPT));
+        let mut pending = String::new();
+        let mut frame = None;
+        let result = session
+            .exec_stream(&command, cancel_rx, |chunk| {
+                consume_resource_stream_chunk(&mut pending, &mut frame, chunk, &on_event)
+            })
+            .await;
+
+        let _ = stop_ping.send(true);
+        let _ = ping_task.await;
+        if let Err(error) = result {
+            let _ = on_event.send(SshResourceStreamEvent::Error { message: error });
+        }
+
+        let mut streams = streams.lock().await;
+        if streams
+            .get(&key)
+            .is_some_and(|task| Arc::ptr_eq(&task.identity, &identity))
+        {
+            streams.remove(&key);
+        }
+    });
+    Ok(())
+}
+
+/// Stop just the monitor started by this status bar instance.
+#[tauri::command]
+pub async fn ssh_resource_stream_stop(
+    state: tauri::State<'_, SshState>,
+    id: u32,
+    stream_id: String,
+) -> Result<(), String> {
+    if let Some(task) = state.resource_streams.lock().await.get(&(id, stream_id)) {
+        let _ = task.cancel.send(true);
+    }
+    Ok(())
+}
+
 /// Open one more interactive shell (a terminal tab) on the live session `id`,
 /// streaming its output to `on_event`. Returns the shell's id within the
 /// session.
@@ -930,6 +1418,15 @@ pub async fn ssh_shell_close(
 
 #[tauri::command]
 pub async fn ssh_close(state: tauri::State<'_, SshState>, id: u32) -> Result<(), String> {
+    let mut streams = state.resource_streams.lock().await;
+    for ((session_id, _), task) in streams.iter() {
+        if *session_id == id {
+            let _ = task.cancel.send(true);
+        }
+    }
+    streams.retain(|(session_id, _), _| *session_id != id);
+    drop(streams);
+
     let session = state.sessions.write().await.remove(&id);
     if let Some(s) = session {
         s.close().await;
