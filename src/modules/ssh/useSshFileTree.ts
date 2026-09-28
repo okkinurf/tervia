@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { sameEntries } from "@/modules/explorer/lib/useFileTree";
 import { sftpCreateDir, sftpCreateFile, sftpDelete, sftpReadDir, sftpRename } from "./sftp";
+import { remoteBasename, remoteDirname, remoteJoin, remoteMoveTarget } from "./remotePath";
 import { coalesceResume } from "@/lib/windowResume";
+import { toast } from "@/components/ui/toast";
+import { describeError } from "@/lib/describeError";
+import { humanizeFsError } from "@/lib/fsError";
 
 // SFTP-backed file tree. Same shape as `useFileTree` so `FileTreeNode` can
 // render it unchanged. Differences from the local hook:
@@ -36,20 +40,11 @@ export type PendingCreate = {
   kind: "file" | "dir";
 };
 
-function joinPath(parent: string, name: string): string {
-  if (parent.endsWith("/")) return `${parent}${name}`;
-  return `${parent}/${name}`;
-}
-
-function dirname(path: string): string {
-  const i = path.lastIndexOf("/");
-  if (i <= 0) return "/";
-  return path.slice(0, i);
-}
-
 type Options = {
   /** Include dot-prefixed entries. */
   includeHidden?: boolean;
+  /** A remote entry moved or was renamed, so open editor tabs can follow. */
+  onPathRenamed?: (sessionId: number, from: string, to: string) => void;
 };
 
 /** Poll interval (ms) for silent re-reads while the window is visible. Slower
@@ -65,7 +60,11 @@ export function useSshFileTree(
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [pendingCreate, setPendingCreate] = useState<PendingCreate | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
+  /** Paths with a delete still running, so the row shows "Deleting…". */
+  const [deleting, setDeleting] = useState<Set<string>>(new Set());
   const includeHidden = options?.includeHidden ?? false;
+  const onPathRenamedRef = useRef(options?.onPathRenamed);
+  onPathRenamedRef.current = options?.onPathRenamed;
 
   // Per-path fetch generation. Guards against race conditions within a
   // session. Reset on session change.
@@ -279,7 +278,7 @@ export function useSshFileTree(
         setPendingCreate(null);
         return;
       }
-      const path = joinPath(pendingCreate.parentPath, trimmed);
+      const path = remoteJoin(pendingCreate.parentPath, trimmed);
       try {
         if (pendingCreate.kind === "dir") {
           await sftpCreateDir(sessionId, path);
@@ -307,15 +306,16 @@ export function useSshFileTree(
     async (newName: string) => {
       if (!renaming || sessionId === null) return;
       const trimmed = newName.trim();
-      const parent = dirname(renaming);
+      const parent = remoteDirname(renaming);
       const oldName = renaming.slice(parent === "/" ? 1 : parent.length + 1);
       if (!trimmed || trimmed === oldName) {
         setRenaming(null);
         return;
       }
-      const to = joinPath(parent, trimmed);
+      const to = remoteJoin(parent, trimmed);
       try {
         await sftpRename(sessionId, renaming, to);
+        onPathRenamedRef.current?.(sessionId, renaming, to);
         await fetchChildren(parent);
       } catch (e) {
         console.error("ssh rename failed:", e);
@@ -329,11 +329,44 @@ export function useSshFileTree(
   const deletePath = useCallback(
     async (path: string) => {
       if (sessionId === null) return;
+      setDeleting((s) => new Set(s).add(path));
       try {
         await sftpDelete(sessionId, path);
-        await fetchChildren(dirname(path));
+        await fetchChildren(remoteDirname(path));
       } catch (e) {
         console.error("ssh delete failed:", e);
+        toast(`Delete failed: ${humanizeFsError(describeError(e)).message}`, { variant: "error" });
+      } finally {
+        setDeleting((s) => {
+          const next = new Set(s);
+          next.delete(path);
+          return next;
+        });
+      }
+    },
+    [fetchChildren, sessionId],
+  );
+
+  /** Move `from` into the folder `toDir` (a drag within the Remote tree). The
+   *  success toast makes an accidental drag-move visible; the server-side
+   *  collision refusal comes from `ssh_sftp_rename`. Stale `expanded`/`nodes`
+   *  entries under the old path stay, as with `deletePath`. */
+  const moveEntry = useCallback(
+    async (from: string, toDir: string) => {
+      if (sessionId === null) return;
+      const to = remoteMoveTarget(from, toDir);
+      if (to === null) return;
+      try {
+        await sftpRename(sessionId, from, to);
+        onPathRenamedRef.current?.(sessionId, from, to);
+        await Promise.all([
+          fetchChildren(remoteDirname(from), { silent: true }),
+          fetchChildren(toDir, { silent: true }),
+        ]);
+        toast(`Moved ${remoteBasename(from)} to ${toDir}`, { variant: "success" });
+      } catch (e) {
+        console.error("ssh move failed:", e);
+        toast(`Move failed: ${describeError(e)}`, { variant: "error" });
       }
     },
     [fetchChildren, sessionId],
@@ -345,6 +378,7 @@ export function useSshFileTree(
       expanded,
       pendingCreate,
       renaming,
+      deleting,
       toggle,
       expand,
       refresh,
@@ -357,13 +391,15 @@ export function useSshFileTree(
       cancelRename,
       commitRename,
       deletePath,
-      joinPath,
+      moveEntry,
+      joinPath: remoteJoin,
     }),
     [
       nodes,
       expanded,
       pendingCreate,
       renaming,
+      deleting,
       toggle,
       expand,
       refresh,
@@ -376,6 +412,7 @@ export function useSshFileTree(
       cancelRename,
       commitRename,
       deletePath,
+      moveEntry,
     ],
   );
 }

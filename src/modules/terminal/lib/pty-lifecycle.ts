@@ -9,6 +9,7 @@ import {
   REATTACH_REPAINT_CHECK_MS,
   REATTACH_REPAINT_NUDGE_GAP_MS,
   ALT_EXIT_REPAINT_DELAY_MS,
+  REPAINT_NUDGE_ECHO_MS,
   isDebugPty,
   describeError,
   readTerminalViewport,
@@ -17,6 +18,24 @@ import { containsSchemeSeparator, findLocalUrl } from "./detectUrl";
 import { forwardDetectedUrl, openSshForSession, writeSshBanner } from "./ssh-session";
 import { useTerminalTitles } from "./terminalTitles";
 import { createWriteMeter } from "./writeMeter";
+
+/**
+ * True when `el` is laid out and the window is on-screen, i.e. a `fitAddon.fit()`
+ * would measure a real size. On Windows a minimized (or hidden) borderless window
+ * reports a ~0px container (the same event App.tsx guards for the sidebar); fitting
+ * to that collapses xterm to FitAddon's 2x1 floor and rewraps the whole scrollback,
+ * and the reflow back on restore is lossy - the cursor/text end up garbled. Skipping
+ * the fit while collapsed keeps the buffer untouched, so restore needs no repair.
+ * The `< 2` floor matches MIN_PTY_DIM; real panes are hundreds of px wide.
+ */
+function canFit(el: HTMLElement | null | undefined): el is HTMLElement {
+  return (
+    !!el &&
+    document.visibilityState === "visible" &&
+    el.clientWidth >= MIN_PTY_DIM &&
+    el.clientHeight >= MIN_PTY_DIM
+  );
+}
 
 /**
  * Push xterm dimensions to the live PTY, floored to MIN_PTY_DIM and
@@ -35,6 +54,33 @@ export function syncPtySize(s: Session): boolean {
 }
 
 /**
+ * Fit the grid to its container and push the result to the PTY. For every
+ * cell-width change that leaves the container's CSS size alone, which the
+ * ResizeObserver in `attachSession` never sees: a renderer swap (WebGL floors
+ * the cell width to whole device pixels, the DOM renderer does not), a
+ * devicePixelRatio change, a font change. Records the fitted size as
+ * `lastW/lastH` so that observer's dedupe compares against what was actually
+ * fitted. When `canFit` refuses (hidden document, 0px container) it zeroes
+ * them instead, so the observer's next real-size tick refits rather than
+ * deduping against a size this grid was never fitted to, and so the
+ * `visibilitychange` listener in `session-lifecycle` knows this pane still
+ * owes a refit. `fit()` and `syncPtySize` each no-op when nothing changed, so
+ * an unchanged grid sends no SIGWINCH.
+ */
+export function refitSession(s: Session): void {
+  const el = s.term.element?.parentElement;
+  if (!canFit(el)) {
+    s.lastW = 0;
+    s.lastH = 0;
+    return;
+  }
+  s.fitAddon.fit();
+  s.lastW = el.clientWidth;
+  s.lastH = el.clientHeight;
+  syncPtySize(s);
+}
+
+/**
  * Flush terminal-originated bytes buffered while the PTY handle was null.
  * Call immediately after assigning `s.pty`. The critical payload is xterm's
  * reply to a DSR cursor-position query (`ESC[6n`) the shell streams during
@@ -48,6 +94,33 @@ export function flushPendingInput(s: Session): void {
   const data = s.pendingInput.join("");
   s.pendingInput = [];
   void s.pty.write(data);
+}
+
+/**
+ * Wrap a reattach's `onData` so OSC 52 is muted while xterm parses the FIRST
+ * chunk: the daemon's scrollback replay (`PtyClient::attach`). Copies in it
+ * are history; running them again would put stale text on the host clipboard
+ * on every relaunch. xterm parses writes in order, so the empty write's
+ * callback fires right after the replay has been parsed. The write meter is
+ * fresh per spawn, so this first chunk goes straight to xterm (nothing is
+ * outstanding yet) instead of being held past the unmute.
+ */
+export function muteOsc52ForReplay(
+  s: Session,
+  onData: (bytes: Uint8Array) => void,
+): (bytes: Uint8Array) => void {
+  let replayed = false;
+  return (bytes) => {
+    if (replayed) return onData(bytes);
+    replayed = true;
+    s.osc52Muted = true;
+    onData(bytes);
+    if (!s.disposed) {
+      s.term.write("", () => {
+        s.osc52Muted = false;
+      });
+    }
+  };
 }
 
 export function openPtyForSession(s: Session, cwd: string | undefined): Promise<PtySession> {
@@ -229,7 +302,10 @@ export function openPtyForSession(s: Session, cwd: string | undefined): Promise<
       (async (): Promise<PtySession> => {
         let attached: PtySession;
         try {
-          attached = await reattachPty(reattachId, spawnCols, spawnRows, { onData, onExit });
+          attached = await reattachPty(reattachId, spawnCols, spawnRows, {
+            onData: muteOsc52ForReplay(s, onData),
+            onExit,
+          });
         } catch (e) {
           if (isDebugPty()) {
             console.info(
@@ -352,6 +428,12 @@ export function armNoDataWatchdog(s: Session, epoch: number): void {
 }
 
 /**
+ * When `nudgeResizeRoundTrip` last sent its fake SIGWINCH, per session. Read by
+ * `armAltExitRepaintWatchdog` to recognise the program's echo of it.
+ */
+const lastRepaintNudgeAt = new WeakMap<Session, number>();
+
+/**
  * Arm a one-shot blank-viewport repaint check for the current spawn. A short
  * time after a byte that should have painted, if the normal-screen viewport is
  * still empty while the shell is live, force the shell's line editor
@@ -381,6 +463,7 @@ export function armNoDataWatchdog(s: Session, epoch: number): void {
  */
 export function nudgeResizeRoundTrip(s: Session, epoch: number): void {
   if (!s.pty) return;
+  lastRepaintNudgeAt.set(s, performance.now());
   const cols = Math.max(MIN_PTY_DIM, s.term.cols);
   const rows = Math.max(MIN_PTY_DIM, s.term.rows);
   const nudgeRows = rows > MIN_PTY_DIM ? rows - 1 : rows + 1;
@@ -515,15 +598,21 @@ function maybeNudgeOnRendererSwitch(s: Session, bytes: Uint8Array): void {
  *
  * Recovery, deferred so the relaunch's first frame has landed: reset the scroll
  * region (DECSC/DECRC wrap it so the cursor + SGR are preserved; a no-op for a
- * plain shell prompt), force a full local repaint, then SIGWINCH the PTY in a
- * round-trip so the foreground program redraws its frame at the correct current
+ * plain shell prompt) and force a full local repaint. When an AI CLI owned the
+ * pane at the trigger, also rebuild the WebGL glyph atlas and SIGWINCH the PTY
+ * in a round-trip so its relaunched renderer redraws at the correct current
  * size - which is what brings the prompt back on-screen and "un-deads" input.
- * The row toggle defeats ConPTY's same-size resize coalescing. Mirrors
- * `armBlankViewportRepaint`; fires only on the alt->normal edge so a TUI
- * being launched (normal->alt) is never disturbed.
+ * The row toggle defeats ConPTY's same-size resize coalescing. A trigger within
+ * `REPAINT_NUDGE_ECHO_MS` of the last nudge is the program answering that
+ * nudge and gets the local repair only. Mirrors `armBlankViewportRepaint`;
+ * fires only on the alt->normal edge so a TUI being launched (normal->alt) is
+ * never disturbed.
  */
 export function armAltExitRepaintWatchdog(s: Session): void {
   const epoch = s.ptySpawnEpoch;
+  // Sampled at the trigger, not when the timer fires: the AI CLI detector drops
+  // the tool on its next tick after an alt-screen exit, well inside the delay.
+  const aiCli = s.aiCliStatus !== null;
   setTimeout(() => {
     if (s.disposed || epoch !== s.ptySpawnEpoch || !s.pty) return;
     let isAlt = false;
@@ -533,17 +622,27 @@ export function armAltExitRepaintWatchdog(s: Session): void {
       return;
     }
     if (isAlt) return; // a TUI re-entered the alt screen during the delay
+    // The local repair cannot feed back, so it runs even inside the echo window.
+    // ponytail: fixed window, escapes once that echo takes >~800ms (a very slow
+    // SSH link); accepted in `KNOWN-LIMITS.md`.
+    const echo =
+      performance.now() - (lastRepaintNudgeAt.get(s) ?? -Infinity) < REPAINT_NUDGE_ECHO_MS;
+    // Only an AI CLI's relaunched renderer needs the atlas rebuild and the
+    // SIGWINCH (Claude Code's `/tui` switch; 2.1.280's fullscreen renderer is on
+    // the alternate screen). Any other program redraws itself on its alt exit.
+    // Accepted in `KNOWN-LIMITS.md`.
+    const full = aiCli && !echo;
     try {
       // DECSC + DECSTBM-reset + DECRC: reset the scroll region, keep the cursor.
       s.term.write("\x1b7\x1b[r\x1b8");
       // Force the WebGL renderer to re-rasterize glyphs, clearing any stale
       // texture-atlas cells left behind by the renderer-switch redraw.
-      s.webglAddon?.clearTextureAtlas();
+      if (full) s.webglAddon?.clearTextureAtlas();
       s.term.refresh(0, s.term.rows - 1);
     } catch {
       return;
     }
-    nudgeResizeRoundTrip(s, epoch);
+    if (full) nudgeResizeRoundTrip(s, epoch);
   }, ALT_EXIT_REPAINT_DELAY_MS);
 }
 

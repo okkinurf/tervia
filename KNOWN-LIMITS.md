@@ -11,10 +11,11 @@ the same change that lifts it.
   RD Gateway, Kerberos (NTLM only), multi-monitor, `.rdp` import, 9+
   sessions. `src-tauri/src/modules/rdp/mod.rs` (module docs,
   `MAX_RDP_SESSIONS`), `session.rs` (`NoNetworkClient`).
-- **SFTP**: download to local disk, folder upload, opening files over
-  16 MiB or not UTF-8, uploads over 256 MiB.
-  `src-tauri/src/modules/ssh/sftp.rs` (`MAX_SFTP_READ_BYTES`,
-  `MAX_UPLOAD_BYTES`).
+- **SFTP**: folder download, folder upload, dragging a remote file out to
+  the OS file manager, opening files over 16 MiB or not UTF-8, uploads or
+  downloads over 256 MiB. `src-tauri/src/modules/ssh/sftp.rs`
+  (`MAX_SFTP_READ_BYTES`, `MAX_UPLOAD_BYTES`, `MAX_DOWNLOAD_BYTES`),
+  `src/modules/terminal/lib/useTerminalFileDrop.ts` (`ensureFsDragListener`).
 - **SSH**: `ssh-rsa` (SHA-1) host keys. `src-tauri/src/modules/ssh/session.rs`
   (`HOST_KEY_ALGOS`).
 - **Resource monitoring**: live metrics require a Linux SSH host with `/proc`
@@ -28,6 +29,11 @@ the same change that lifts it.
 - **Import**: `ssh_config` stanzas using `ProxyCommand`, `Include`, `Match`
   or wildcard `Host`; PuTTY sessions with a proxy or a non-SSH protocol.
   `src/modules/backup/sshConfigImport.ts`, `puttyRegImport.ts`.
+- **Terminal OSC 52**: clipboard reads (a `?` request is never answered), a
+  separate PRIMARY selection (every target writes the system clipboard), and
+  copies over 1 MiB decoded (dropped).
+  `src/modules/terminal/lib/osc-handlers.ts` (`registerClipboardHandler`,
+  `OSC52_MAX_BYTES`).
 
 ## SSH sessions
 
@@ -41,6 +47,26 @@ the same change that lifts it.
   can show a new endpoint while the shell still rides the old one until
   every reference lets go. `src/modules/ssh/tunnel.ts` (`sessionFor`).
   Changes when: a report of an edit not applying.
+
+## Terminal
+
+- **Only a detected AI CLI gets a resize nudge after leaving the alternate
+  screen.** vim, less, htop, omp and an AI CLI the detector does not
+  recognise get the scroll-region reset and a repaint, never a SIGWINCH or
+  a glyph-atlas rebuild. The detector also drops Claude Code at its first
+  fullscreen-to-classic exit, so a later `/tui default` in the same run gets
+  the local repair only. `src/modules/terminal/lib/pty-lifecycle.ts`
+  (`armAltExitRepaintWatchdog`). Changes when: a report of a broken prompt
+  after a `/tui default` switch, or of a program that only redraws after a
+  resize.
+- **The alt-exit watchdog treats a trigger within about 0.8 s of its own
+  nudge as that nudge's echo** (1 s, measured when the repair runs 180 ms
+  after the trigger). A program that answers the nudge more slowly (a very
+  slow SSH link) re-arms the full recovery about once a second, and a
+  genuine AI CLI alt exit inside the window gets the local repair only.
+  `src/modules/terminal/lib/session-helpers.ts` (`REPAINT_NUDGE_ECHO_MS`),
+  `src/modules/terminal/lib/pty-lifecycle.ts` (`armAltExitRepaintWatchdog`).
+  Changes when: the flicker is reported again on a slow link.
 
 ## Forwards
 

@@ -4,82 +4,24 @@ The latest release only. Every earlier version:
 [GitHub Releases](https://github.com/rendyuwu/tervia/releases). Versions:
 [SemVer](https://semver.org/); before `1.0` a minor bump may break things.
 
-## [0.1.0] - 26-09-2026
+## [Unreleased]
 
-First release. Forked from [TEDI](https://github.com/IlhamriSKY/TEDI) v0.4.22,
-itself forked from [Terax](https://github.com/crynta/terax-ai) v0.5.9. Earlier
-history: their changelogs and `git log`.
+### Fixed
+
+**Terminal**
+
+- A terminal pane's column count now matches its width after the renderer changes (the App opacity crossing the glass edge, turning the WebGL setting off or on, a lost GPU context) or the window moves to a display with another scale. Text no longer runs past the pane's right edge, typing near the edge no longer scrolls the pane sideways, and a new pane no longer starts a few columns narrower than it is.
+
+## [0.1.2] - 27-09-2026
 
 ### Added
 
-**Hosts and vault**
+- Drag a file from the local Files explorer onto the Remote tree to upload it: onto a folder, onto a file for that file's folder, or onto empty tree space for the root. A drag never replaces an existing remote file; OS drop and paste still do.
 
-- One host list for SSH and RDP: nested groups, tags, icon and colour, last connected.
-- Vault: identities and keys shared by many hosts, each showing when it last connected. A group can set a default identity for new hosts.
-- Key editor: generate Ed25519, ECDSA P-256 or RSA-4096. OpenSSH certificate and hardware (ssh-agent) key kinds.
-- Connect from the Hosts page (arrow keys move between cards), the header quick connect, or `#` in the Command Palette.
-- Import from `~/.ssh/config` and PuTTY `.reg` exports.
-- Vault page finds keychain entries no record uses and deletes them.
+### Changed
 
-**SSH**
+- A remote file dragged onto the local Files explorer can also land on a file row (its folder) or on empty tree space (the root), not only on a folder row.
 
-- Auth: password, private key, ssh-agent, OpenSSH certificate, hardware key.
-- SHA-256 host-key pinning with a first-connect trust prompt. Known Hosts page lists and revokes SSH and RDP pins.
-- Jump host chains.
-- One session per host, shared by terminal tabs, forwards and RDP tunnels.
+### Fixed
 
-**Port forwarding**
-
-- `-L`, `-R` and SOCKS5 `-D` rules on the Port Forwarding page.
-- Start by hand, with the host's terminal (`-L` only), or at app launch with retry backoff.
-- A `localhost:PORT` URL printed by a remote shell gets a local forward.
-
-**SFTP**
-
-- Remote file tree: upload by drop (files, up to 256 MiB), open text files up to 16 MiB and save them, create, rename, delete.
-
-**RDP**
-
-- TLS and CredSSP (NTLM), certificate pinning, RemoteFX and bitmap graphics.
-- Resize to fit the pane (Display Control), or a fixed size.
-- Clipboard text and images, direction set per host.
-- Tunnel through a saved SSH host. Up to 8 sessions.
-
-**Backup and sync**
-
-- `.tervia-backup` (format v3): hosts, groups, vault, forward rules and secrets, sealed with PBKDF2-HMAC-SHA256 (600,000 rounds) and AES-256-GCM.
-- End-to-end encrypted sync over S3-compatible storage or WebDAV. Per-record AES-256-GCM, last writer wins, 90-day tombstones. Off by default; key bodies opt-in.
-
-**Workspace**
-
-- Local terminals on xterm.js (WebGL). Shell integration for zsh, bash, fish and PowerShell. PTYs survive closing the window.
-- Split panes, tabs, saved workspaces, pop-out windows.
-- CodeMirror 6 editor: vim mode, format on save (Prettier or an external formatter), Markdown preview.
-- File explorer: go to file, search and replace in files, git decorations.
-- Status of AI agent CLIs (Claude Code, Codex, Gemini, ...) in a terminal, and a board of them.
-- Themes (import and export `.tervia` files), rebindable shortcuts, Command Palette.
-- CLI: `tervia [PATH]`, `--help`, `--version`, `--update`.
-- Signed updates, checked every 6 hours, installed on request.
-
-### Changed (vs TEDI v0.4.22)
-
-- Breaking: Tervia reads nothing TEDI saved. Settings, workspaces, SSH connections and saved passwords start empty, and `.tedi-ssh` exports cannot be imported.
-- `Ctrl+]` / `Ctrl+[` move pane focus even when a terminal or RDP pane has focus. Rebind `pane.focusNext` / `pane.focusPrev` to give them back to the shell.
-
-### Fixed (vs TEDI v0.4.22)
-
-- `Ctrl+P` and `Ctrl+G` reach a focused terminal instead of opening Go to file.
-- Close Tabs to the Right asks once for every tab with unsaved changes or a running process, instead of asking about the last one and leaving the rest open.
-- The host-key prompt dims the terminal behind it without blurring, so reconnect messages stay readable.
-- Settings and saved workspaces damaged by a crash mid-save are restored from their last good copy instead of reset to defaults.
-- Saved SSH passwords, keys and passphrases no longer pass through the UI on connect, and no decrypted secret stays cached in memory.
-
-### Removed (vs TEDI v0.4.22)
-
-- AI agent: providers, MCP, sub-agents, autocomplete, AI diff tab. Detecting agent CLIs in a terminal stays.
-- Extension system and the `ext` CLI subcommand.
-- In-app browser. Dev-server links, Preview in Browser and PDFs open in the system browser.
-- Source Control panel. Explorer git decorations stay.
-- Task scheduler.
-- Private tabs (Mark as Private, Private Terminal).
-- `theme` CLI subcommand and headless `--update`. `--update` now opens the window.
+- omp and other programs that briefly open the alternate screen on every resize no longer flicker nonstop after an overlay closes or the pane is resized, locally or over SSH. After leaving the alternate screen, only a detected AI CLI gets a resize nudge.

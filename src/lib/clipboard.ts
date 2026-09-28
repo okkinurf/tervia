@@ -24,3 +24,32 @@ export async function readClipboardText(): Promise<string> {
     return "";
   }
 }
+
+/**
+ * Local paths an OS file manager copied, read through the host process
+ * (`clipboard_read_file_list`). `[]` means nothing file-shaped to paste, the
+ * same no-throw contract as `readClipboardText`.
+ */
+export async function readClipboardFiles(): Promise<string[]> {
+  try {
+    return await invoke<string[]>("clipboard_read_file_list");
+  } catch (e) {
+    console.warn("clipboard file read failed:", e);
+    return [];
+  }
+}
+
+/**
+ * Write through the host process (`clipboard_write_text`), for writes that
+ * come with no user gesture: an OSC 52 copy arrives on the PTY stream. Copies
+ * the user makes (select-to-copy, right-click, Ctrl+Shift+C) stay on
+ * `navigator.clipboard.writeText`. Never rejects; a failure is logged, the
+ * same contract as the reads above.
+ */
+export async function writeClipboardText(text: string): Promise<void> {
+  try {
+    await invoke("clipboard_write_text", { text });
+  } catch (e) {
+    console.warn("clipboard write failed:", e);
+  }
+}

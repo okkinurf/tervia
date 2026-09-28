@@ -24,7 +24,7 @@ import { useGitDecoration } from "./lib/gitDecorations";
 import { fileIconUrl, folderIconUrl } from "./lib/iconResolver";
 import { COMPACT_CONTENT, COMPACT_ITEM } from "./lib/menuItemClass";
 import type { DirEntry, useFileTree } from "./lib/useFileTree";
-import { ChevronRight, Lock } from "lucide-react";
+import { ChevronRight, LoaderCircle, Lock } from "lucide-react";
 
 type Tree = ReturnType<typeof useFileTree>;
 
@@ -46,6 +46,11 @@ type Props = {
   /** Set by the SFTP tree. Hides actions that only make sense for a path on
    *  this machine, so a remote row never offers something guaranteed to fail. */
   remote?: boolean;
+  /** Remote tree only: Download… on a file row. */
+  onDownload?: (path: string) => void;
+  /** Remote tree only: Paste uploads the OS-copied files into this folder (a
+   *  file row: its parent). */
+  onPaste?: (dir: string) => void;
 };
 
 function FileTreeNodeImpl({
@@ -61,6 +66,8 @@ function FileTreeNodeImpl({
   selectedPath,
   onSelectPath,
   remote = false,
+  onDownload,
+  onPaste,
 }: Props) {
   const path = tree.joinPath(parentPath, entry.name);
   const isDir = entry.kind === "dir";
@@ -69,6 +76,7 @@ function FileTreeNodeImpl({
   const isExpanded = isDir && tree.expanded.has(path);
   const children = isExpanded ? tree.nodes[path] : undefined;
   const isRenaming = tree.renaming === path;
+  const isDeleting = tree.deleting.has(path);
 
   const [confirmDelete, setConfirmDelete] = useState(false);
 
@@ -78,8 +86,9 @@ function FileTreeNodeImpl({
   // color on folders with changed descendants, plus an ignored flag.
   const { deco, ignored } = useGitDecoration(path, isDir);
   // Dot-prefixed (hidden) or gitignored entries are de-emphasized like VSCode
-  // so they don't compete with regular files for attention.
-  const dim = entry.name.startsWith(".") || ignored;
+  // so they don't compete with regular files for attention. A row being
+  // deleted fades the same way.
+  const dim = entry.name.startsWith(".") || ignored || isDeleting;
 
   const handleNodeSelect = useCallback(() => {
     if (tree.renaming) return;
@@ -128,9 +137,8 @@ function FileTreeNodeImpl({
               // cursor over every drop zone. Instead, drag handling is
               // synthesized from `mousedown`/`mousemove`/`mouseup` by
               // `useTerminalFileDrop.ts::ensureFsDragListener`, which hit-
-              // tests the source against `[data-fs-path]` and the target
-              // against `[data-terminal-leaf-id]`. See that file for the
-              // full rationale.
+              // tests the source against `[data-fs-path]`; see that file for
+              // the drop targets and the full rationale.
               data-fs-kind={entry.kind}
               onClick={handleNodeSelect}
               onDoubleClick={() => !isDir && tree.beginRename(path)}
@@ -167,11 +175,19 @@ function FileTreeNodeImpl({
               </span>
               {/* Remote (SFTP) rows carry a Unix mode summary; local rows leave
                   it undefined. Muted mono so it reads as metadata, not content.
-                  mr-2 clears the ScrollArea overlay thumb like the git letter. */}
-              {entry.permissions && (
-                <span className="text-muted-foreground/60 mr-2 shrink-0 font-mono text-[10px] tracking-tight tabular-nums">
-                  {entry.permissions}
+                  mr-2 clears the ScrollArea overlay thumb like the git letter.
+                  A delete in flight takes its place until the row goes away. */}
+              {isDeleting ? (
+                <span className="text-muted-foreground/70 mr-2 flex shrink-0 items-center gap-1 text-[10px]">
+                  <LoaderCircle size={11} strokeWidth={2} className="animate-spin" />
+                  Deleting…
                 </span>
+              ) : (
+                entry.permissions && (
+                  <span className="text-muted-foreground/60 mr-2 shrink-0 font-mono text-[10px] tracking-tight tabular-nums">
+                    {entry.permissions}
+                  </span>
+                )
               )}
               {deco && !isDir && (
                 <span
@@ -197,6 +213,11 @@ function FileTreeNodeImpl({
           {!isDir && (
             <ContextMenuItem className={COMPACT_ITEM} onSelect={() => onOpenFile(path, true)}>
               Open
+            </ContextMenuItem>
+          )}
+          {!isDir && onDownload && (
+            <ContextMenuItem className={COMPACT_ITEM} onSelect={() => onDownload(path)}>
+              Download…
             </ContextMenuItem>
           )}
           {isHtml && onPreviewInBrowser && (
@@ -229,6 +250,11 @@ function FileTreeNodeImpl({
           >
             New Folder
           </ContextMenuItem>
+          {onPaste && (
+            <ContextMenuItem className={COMPACT_ITEM} onSelect={() => onPaste(createTarget)}>
+              Paste
+            </ContextMenuItem>
+          )}
           <ContextMenuSeparator />
           <ContextMenuItem className={COMPACT_ITEM} onSelect={() => void copyToClipboard(path)}>
             Copy Path
@@ -354,6 +380,8 @@ function FileTreeNodeImpl({
             selectedPath={selectedPath}
             onSelectPath={onSelectPath}
             remote={remote}
+            onDownload={onDownload}
+            onPaste={onPaste}
           />
         ))}
     </>

@@ -7,6 +7,7 @@
  * `useTerminalSession` hook stays a thin binding layer over these functions.
  */
 
+import { writeClipboardText } from "@/lib/clipboard";
 import { buildContentFontFamily } from "@/lib/fonts";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { resolveTerminalPreset } from "@/modules/settings/terminalPalette";
@@ -18,6 +19,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import {
+  registerClipboardHandler,
   registerCwdHandler,
   registerProgressHandler,
   registerPromptTracker,
@@ -47,6 +49,7 @@ import {
   armAltExitRepaintWatchdog,
   flushPendingInput,
   openPtyForSession,
+  refitSession,
   retryPty,
   syncPtySize,
   writePtyError,
@@ -133,22 +136,43 @@ if (opacityWin && !opacityWin.__terviaCanvasOpacityBound) {
   });
 }
 
-/**
- * True when `el` is laid out and the window is on-screen, i.e. a `fitAddon.fit()`
- * would measure a real size. On Windows a minimized (or hidden) borderless window
- * reports a ~0px container (the same event App.tsx guards for the sidebar); fitting
- * to that collapses xterm to FitAddon's 2x1 floor and rewraps the whole scrollback,
- * and the reflow back on restore is lossy - the cursor/text end up garbled. Skipping
- * the fit while collapsed keeps the buffer untouched, so restore needs no repair.
- * The `< 2` floor matches MIN_PTY_DIM; real panes are hundreds of px wide.
- */
-export function canFit(el: HTMLElement | null | undefined): boolean {
-  return (
-    !!el &&
-    document.visibilityState === "visible" &&
-    el.clientWidth >= MIN_PTY_DIM &&
-    el.clientHeight >= MIN_PTY_DIM
-  );
+// Refit panes when their cell width can change with no container resize,
+// which the ResizeObserver in `attachSession` cannot see:
+//  - devicePixelRatio changed (window moved to a monitor with another scale, OS
+//    scale changed). Every pane. xterm re-measures its cells from its OWN
+//    matchMedia listener; listener order across media queries is not ours to
+//    rely on, so the fit waits a frame. The query matches only the current
+//    ratio, so it is re-armed on every change.
+//  - the document became visible again. Only panes whose refit `canFit`
+//    skipped while hidden (a renderer swap on GPU context loss during lock or
+//    minimize), which `refitSession` marks by zeroing lastW/lastH; nothing
+//    else refits such a pane when its size did not change (a lock screen). The
+//    rest stay with the ResizeObserver: a Windows restore walks the client area
+//    through ~40-400px (see AppSidebar), and refitting here mid-ramp would send
+//    the shell a SIGWINCH at that transitional width, which the observer's
+//    debounced PTY push absorbs.
+// `refitSession` skips hidden tabs (0px) and no-ops on an unchanged grid.
+const refitWin =
+  typeof window !== "undefined" ? (window as Window & { __terviaRefitBound?: boolean }) : null;
+if (refitWin && !refitWin.__terviaRefitBound) {
+  refitWin.__terviaRefitBound = true;
+  const watchDpr = () => {
+    window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener(
+      "change",
+      () => {
+        watchDpr();
+        requestAnimationFrame(() => {
+          for (const s of sessions.values()) refitSession(s);
+        });
+      },
+      { once: true },
+    );
+  };
+  watchDpr();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    for (const s of sessions.values()) if (s.lastW === 0) refitSession(s);
+  });
 }
 
 export function ensureSession(
@@ -186,6 +210,11 @@ export function ensureSession(
     // Required so the WebGL renderer honours an rgba `theme.background` and
     // lets the Theme tab's wallpaper bleed through the terminal canvas.
     allowTransparency: true,
+    // On macOS, Option+drag forces a normal selection inside a mouse-reporting
+    // app (tmux, vim, htop), like Shift+drag on Linux and Windows.
+    // TerminalPane's select-to-copy then copies it. xterm no longer treats
+    // Option+drag as column selection on macOS.
+    macOptionClickForcesSelection: true,
     // ConPTY resize semantics for local Windows shells - see `WINDOWS_PTY`.
     // An SSH leaf's pty is on the remote host, so it keeps xterm's Unix
     // default; xterm normalizes the undefined back to that default.
@@ -248,6 +277,7 @@ export function ensureSession(
     sawShellIntegration: false,
     pendingCommandInput: false,
     pendingInput: [],
+    osc52Muted: false,
   };
   sessions.set(leafId, session);
 
@@ -336,14 +366,13 @@ export function ensureSession(
   session.cleanups.push(() => titleSub.dispose());
 
   // Repair the pane when a foreground program LEAVES the alternate screen
-  // (CSI ?1049l). The trigger case is Claude Code's `/tui fullscreen` <->
-  // `/tui default` renderer toggle: xterm restores the cursor but not the
-  // normal buffer's scroll region, no pane-pixel-size change means the
-  // ResizeObserver never repaints, and the relaunched classic renderer then
-  // draws a corrupted prompt box whose line-editor redraw lands off-screen (so
-  // input looks dead). `armAltExitRepaintWatchdog` resets the region + nudges a
-  // resize. Gated on `sawAltScreenBuffer` so only the alt->normal exit edge
-  // fires - launching a TUI (normal->alt) is left untouched.
+  // (CSI ?1049l): xterm restores the cursor but not the normal buffer's scroll
+  // region, and no pane-pixel-size change means the ResizeObserver never
+  // repaints. `armAltExitRepaintWatchdog` resets the region and repaints; when
+  // an AI CLI owns the pane (Claude Code leaving its fullscreen renderer via
+  // `/tui default`) it also nudges a resize so the relaunched renderer redraws.
+  // Gated on `sawAltScreenBuffer` so only the alt->normal exit edge fires -
+  // launching a TUI (normal->alt) is left untouched.
   let sawAltScreenBuffer = false;
   const bufferSub = term.buffer.onBufferChange(() => {
     let isAlt = false;
@@ -440,6 +469,13 @@ export function ensureSession(
       registerProgressHandler(term, (state, progress) => {
         session.aiCliDetector?.pushProgress(state, progress);
       }),
+      // OSC 52: a program's own copy (tmux copy-mode, neovim, vim-oscyank)
+      // lands on the host clipboard. Written by the host process because the
+      // sequence comes off the PTY stream, with no user gesture behind it.
+      // Skipped while a reattach replays old scrollback (`osc52Muted`).
+      registerClipboardHandler(term, (text) => {
+        if (!session.osc52Muted) void writeClipboardText(text);
+      }),
     );
   })();
 
@@ -510,19 +546,16 @@ export function attachSession(
     container.appendChild(s.term.element);
   }
 
-  // Fit before WebGL and PTY open so renderer and shell start at the right size.
-  // Guarded so an attach that lands while the window is minimized (0px container,
-  // e.g. workspace restore) doesn't fit to a degenerate size or cache 0 as the
-  // last good width - the ResizeObserver fits once the real size lands.
-  if (canFit(container)) {
-    s.fitAddon.fit();
-    s.lastW = container.clientWidth;
-    s.lastH = container.clientHeight;
-  }
-
+  // Load the renderer before fitting: the cell width depends on it, and a
+  // DOM-renderer fit followed by a WebGL load leaves the grid narrower than the
+  // pane. Both happen before the PTY opens, so the shell and the
+  // `lastSentCols/Rows` seed below use the final size. `refitSession` skips a
+  // minimized window's 0px container (e.g. workspace restore) instead of fitting
+  // to a degenerate size - the ResizeObserver fits once the real size lands.
   if (firstAttach && !s.webglAddon && s.webglEnabled && !wallpaperActive()) {
     loadWebglRenderer(s);
   }
+  refitSession(s);
 
   if (!s.pty && !s.ptyOpening) {
     s.ptyOpening = true;
